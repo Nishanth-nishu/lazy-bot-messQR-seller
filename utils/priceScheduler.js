@@ -14,6 +14,43 @@ let storedOpts = null;
 
 let testingStartDate = null;
 
+// The sale window: opens when the first post goes out (or the bot starts mid-window)
+// and closes at the meal's stop time. Buyers are only engaged while it is open.
+let windowOpenedAt = null;
+let windowStopAt = null;
+
+/** True while a listing is up in the groups and not yet sold or stopped. */
+function isListingLive() {
+    return Boolean(!stopped && windowOpenedAt && windowStopAt && Date.now() < windowStopAt.getTime());
+}
+
+/** True between today's first post and the stop time, even after a sale. */
+function isWithinSaleWindow() {
+    return Boolean(windowOpenedAt && windowStopAt && Date.now() < windowStopAt.getTime());
+}
+
+/**
+ * Parse PRICE_SCHEDULE ("07:30=25, 09:00=20, 09:15=15") into steps sorted by time.
+ */
+function parsePriceSchedule() {
+    return String(config.PRICE_SCHEDULE || '')
+        .split(',')
+        .map((part) => /^\s*(\d{1,2}):(\d{2})\s*=\s*(\d+(?:\.\d+)?)\s*$/.exec(part))
+        .filter(Boolean)
+        .map(([, h, m, price]) => ({ hour: Number(h), minute: Number(m), price: Number(price) }))
+        .sort((a, b) => (a.hour * 60 + a.minute) - (b.hour * 60 + b.minute));
+}
+
+/** Price of the last schedule step at or before `when`, or null if none applies yet. */
+function priceFromSchedule(steps, when) {
+    const minutes = when.getHours() * 60 + when.getMinutes();
+    let price = null;
+    for (const step of steps) {
+        if (step.hour * 60 + step.minute <= minutes) price = step.price;
+    }
+    return price;
+}
+
 /**
  * Compute equally-spaced send times between meal start and end.
  * @param {string} meal — 'breakfast', 'lunch', or 'dinner'
@@ -39,7 +76,8 @@ function computeSchedule(meal, numMessages) {
         }
         console.log('🧪 [Scheduler] TESTING mode is ON — bypassing meal timing.');
         startDate.setTime(testingStartDate.getTime());
-        endDate.setTime(testingStartDate.getTime() + safeNumMessages * 30 * 1000);
+        // One post every 2 minutes, so there's time to pay and send a screenshot.
+        endDate.setTime(testingStartDate.getTime() + safeNumMessages * 2 * 60 * 1000);
     } else {
         const [startH, startM] = timing.start.split(':').map(Number);
         const [endH, endM] = timing.end.split(':').map(Number);
@@ -54,9 +92,24 @@ function computeSchedule(meal, numMessages) {
         }
     }
     const totalMs = endDate.getTime() - startDate.getTime();
-    const intervalMs = safeNumMessages > 1 ? totalMs / safeNumMessages : totalMs;
-
     const times = [];
+
+    // Fixed gap (e.g. every 30 min from 07:30 until 09:30), outside testing mode.
+    // Each PRICE_SCHEDULE change inside the window also gets its own post.
+    const fixedIntervalMs = config.POST_INTERVAL_MINUTES > 0 ? config.POST_INTERVAL_MINUTES * 60 * 1000 : 0;
+    if (!config.TESTING && fixedIntervalMs > 0) {
+        const slots = new Set();
+        for (let t = startDate.getTime(); t < endDate.getTime(); t += fixedIntervalMs) slots.add(t);
+        for (const step of parsePriceSchedule()) {
+            const at = new Date(startDate);
+            at.setHours(step.hour, step.minute, 0, 0);
+            if (at >= startDate && at < endDate) slots.add(at.getTime());
+        }
+        for (const t of [...slots].sort((a, b) => a - b)) times.push(new Date(t));
+        return { times, stopTime: endDate };
+    }
+
+    const intervalMs = safeNumMessages > 1 ? totalMs / safeNumMessages : totalMs;
     for (let i = 0; i < safeNumMessages; i++) {
         times.push(new Date(startDate.getTime() + i * intervalMs));
     }
@@ -90,17 +143,25 @@ function startScheduler(sendMessageFn, onStopFn, isSoldFn, opts) {
 
     const { times, stopTime } = computeSchedule(meal, numMessages);
     const now = Date.now();
+    windowOpenedAt = null;
+    windowStopAt = stopTime;
 
     console.log(`💰 [Scheduler] Starting price: ₹${currentPrice}`);
-    console.log(`📅 [Scheduler] Meal: ${meal} | Mess: ${mess} | Messages: ${numMessages}`);
+    console.log(`📅 [Scheduler] Meal: ${meal} | Mess: ${mess} | Messages: ${times.length}`);
     console.log(`📅 [Scheduler] Schedule:`);
 
     let priceForStep = currentPrice;
     const priceDrop = Number.isFinite(config.PRICE_DROP) && config.PRICE_DROP > 0 ? config.PRICE_DROP : 0;
 
+    // PRICE_SCHEDULE (e.g. "07:30=25, 09:00=20, 09:15=15") sets the price by time of day.
+    // Without it, every post drops by PRICE_DROP.
+    const priceSchedule = config.TESTING ? [] : parsePriceSchedule();
+
     for (let i = 0; i < times.length; i++) {
         const sendTime = times[i];
         const delayMs = sendTime.getTime() - now;
+        const scheduled = priceFromSchedule(priceSchedule, sendTime);
+        if (scheduled !== null) priceForStep = scheduled;
         const price = priceForStep;
 
         const timeStr = sendTime.toLocaleTimeString('en-IN', {
@@ -116,6 +177,7 @@ function startScheduler(sendMessageFn, onStopFn, isSoldFn, opts) {
                         return;
                     }
                     currentPrice = price;
+                    if (!windowOpenedAt) windowOpenedAt = new Date();
                     const text = config.sellMessage(mess, meal, price);
                     console.log(`📤 [Scheduler] Sending: "${text}"`);
                     await sendMessageFn(text);
@@ -130,9 +192,11 @@ function startScheduler(sendMessageFn, onStopFn, isSoldFn, opts) {
             console.log(`   ⏭️  (skipped — time already passed)`);
             // Update the current price so that buyers messaging *now* get the correct active price
             currentPrice = price;
+            // Started mid-window: earlier posts are already in the groups, so the listing is live.
+            if (!windowOpenedAt && now < stopTime.getTime()) windowOpenedAt = sendTime;
         }
 
-        priceForStep = Math.max(priceForStep - priceDrop, 0);
+        if (!priceSchedule.length) priceForStep = Math.max(priceForStep - priceDrop, 0);
     }
 
     // Auto-stop timer
@@ -180,4 +244,7 @@ function restartScheduler() {
     }
 }
 
-module.exports = { startScheduler, stopScheduler, getCurrentPrice, setCurrentPrice, getCurrentMeal, restartScheduler };
+module.exports = {
+    startScheduler, stopScheduler, getCurrentPrice, setCurrentPrice, getCurrentMeal, restartScheduler,
+    isListingLive, isWithinSaleWindow,
+};

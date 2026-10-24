@@ -1,0 +1,138 @@
+# Copy this file to Setting.txt and fill in your own details (Setting.txt is git-ignored).
+# Mess QR Seller Bot configuration
+# Format: VARIABLE_NAME=value
+# Lists are comma-separated values.
+# Use \n for line breaks inside message templates.
+
+
+# ─── For Testing ────────────────────────────────────────────────
+TESTING=true
+TESTING_GROUP_NAME=temp1
+
+# ─── Target Group ───────────────────────────────────────────────
+# Posts in every group whose name contains any of these (case doesn't matter)
+GROUP_NAME=Mess Buy Sell, Mess buy and sell
+
+# ─── Meal Timings ───────────────────────────────────────────────
+MEAL_BREAKFAST_START=07:30
+MEAL_BREAKFAST_END=09:30
+MEAL_LUNCH_START=12:30
+MEAL_LUNCH_END=14:30
+MEAL_DINNER_START=19:30
+MEAL_DINNER_END=21:30
+
+# ─── Seller Info ────────────────────────────────────────────────
+# UPI_ID and PAYEE_NAME must match what a buyer's payment screenshot shows as the receiver.
+UPI_ID=YOUR_UPI_ID@bank
+PAYEE_NAME=YOUR NAME AS SHOWN IN UPI
+# Mess meal QR delivered after a sale
+QR_IMAGE_PATH=utils/qr.png
+# Your UPI payment QR, sent to each buyer along with the price (kept outside utils/ on purpose)
+UPI_QR_IMAGE_PATH=assets/upi_qr.png
+
+# WhatsApp number the bot runs on — scan the login QR with this phone
+BOT_NUMBER=
+
+# ─── Payment Verification ───────────────────────────────────────
+# 10-digit number that receives screenshots Claude could not verify.
+# Reply APPROVE or REJECT there. Can be the bot's own number (use "Message yourself").
+ADMIN_NUMBER=
+ANTHROPIC_MODEL=claude-opus-5-5
+# Who reads payment screenshots: ocr = free on-PC text reading, claude = Claude only (needs API credits),
+# auto = Claude when it works, otherwise OCR
+SCREENSHOT_READER=ocr
+# Reject screenshots of payments older than this
+PAYMENT_MAX_AGE_MINUTES=30
+# Screenshots that fail a check are bounced back to the buyer; after this many, move to the next buyer
+MAX_VERIFY_ATTEMPTS=3
+USED_UTR_CSV_PATH=utils/used_utrs.csv
+
+# ─── Defaults ───────────────────────────────────────────────────
+MESS_NAMES=Palash, Kadamba Veg, Kadamba NV, Yuktahar
+DEFAULT_MEAL=breakfast
+DEFAULT_MESS=Kadamba Veg
+DEFAULT_NUM_MESSAGES=4
+DEFAULT_PRICE=25
+PRICE_DROP=5
+# Price by time of day (IST): TIME=PRICE, comma-separated. Each change also gets its own post.
+# Leave empty to drop PRICE_DROP on every post instead.
+PRICE_SCHEDULE=07:30=25, 09:00=20, 09:15=15
+
+# ─── Daily Automation ───────────────────────────────────────────
+# true = skip the setup questions and sell DEFAULT_MEAL every day with the defaults above
+AUTO_DAILY=true
+# Post in the groups every N minutes from meal start until meal end, until sold
+# (0 = spread DEFAULT_NUM_MESSAGES evenly instead)
+POST_INTERVAL_MINUTES=30
+# Fetch the meal QR from dining.iiit.ac.in at this time every day (needs DINING_API_KEY in .env).
+# It's also fetched at startup and right before it's sent to a buyer.
+QR_REFRESH_TIME=07:00
+
+# ─── Negotiation ────────────────────────────────────────────────
+ENABLE_NEGOTIATION=true
+# Only when the buyer asks. TIME=lowest price you'll accept from that time on (none = fixed price).
+NEGOTIATION_SCHEDULE=07:30=none, 08:30=20, 09:00=15, 09:15=10
+# Used only in TESTING mode instead of the schedule
+NEGOTIATION_MARGIN=5
+
+# ─── Deal & payment window ──────────────────────────────────────
+# After the buyer says YES / paying / 👍, they must pay within this many minutes of the deal
+PAYMENT_WINDOW_MINUTES=10
+# Extra minutes to send the screenshot before the meal goes to the next buyer
+SCREENSHOT_GRACE_MINUTES=5
+
+# ─── Buyer Timeout ──────────────────────────────────────────────
+# Time to pay and send a screenshot (only enforced while someone else is waiting)
+BUYER_INACTIVITY_MS=300000
+BUYER_TIMEOUT_WARNING_MS=60000
+
+# ─── Who counts as a buyer ──────────────────────────────────────
+# New buyers are only answered while a listing is up (first post until sold / stop time).
+# Forwarded messages, replies to other messages, and texts longer than this are ignored.
+MAX_BUYER_MESSAGE_LENGTH=80
+# When you message someone yourself from your phone, the bot stays out of that chat for this long
+MANUAL_PAUSE_MINUTES=180
+
+# ─── Keywords ───────────────────────────────────────────────────
+BUYER_KEYWORDS=buy, want, wants, available, available?, interested, need, qr, breakfast, sold, wanna, is it there, kharidna, chahiye, chaiye, dedo, bhejo, bhej, take
+DONE_KEYWORDS=done, paid, sent, pay, kar diya
+
+# ─── Loyalty / Free Meal ─────────────────────────────────────────
+LOYALTY_TARGET=180
+LOYALTY_CSV_PATH=utils/purchases.csv
+FREE_MEAL_ASSIGN_MESSAGE=🎉 Congratulations {buyerName}! You earned a FREE meal! Don't pay anything, just reply *DONE* to get the QR, 
+FREE_MEAL_CONFIRM_MESSAGE=Enjoy your FREE {mealType}, {buyerName}!\nYour total spent reset to ₹0\n\n_Reply *TESTING* if you're not claiming the free meal today_
+LOYALTY_PROGRESS_TEMPLATE=Your total spent: ₹{totalSpent}/₹{target} (₹{remaining} left for a free meal from my side)
+LOYALTY_REACHED_TEMPLATE=🎉 Your total spent crossed ₹{target}! Next meal is FREE from my side!
+
+# ─── Message Templates ──────────────────────────────────────────
+SELL_MESSAGE_TEMPLATE=Sell {messName} {mealTypeCapitalized} @{price}
+PAYMENT_INSTRUCTION_MESSAGE=_This transaction is handled by an automated system._\nReply *YES* (or react 👍) if you're paying ₹{price} now. Then pay within {minutes} min and send the *payment screenshot* here.
+CONFIRM_PROMPT_MESSAGE=Reply *YES* (or react 👍) if you're paying ₹{price} now.
+CONFIRMED_MESSAGE=🤝 Deal at ₹{price}! The meal is held for you.\nPay ₹{price} within {minutes} min and send the *payment screenshot* here. Once it's verified, reply *DONE* to get the QR.
+PAYMENT_WINDOW_EXPIRED_MESSAGE=⌛ The {minutes}-min payment window ended without a valid payment screenshot, so I've moved to the next buyer. Reply *WANT* if you still want it.
+PRICE_LOCKED_MESSAGE=The deal is fixed at ₹{price}. Please pay ₹{price} and send the screenshot.
+SOLD_MESSAGE=Sorry, already sold!
+UNRECOGNIZED_MESSAGE=Please send the *payment screenshot* here after paying
+TIMEOUT_WARNING_MESSAGE=⏳ 1 min left to send the payment screenshot before moving to next buyer
+
+# ─── Payment Verification Messages ──────────────────────────────
+SCREENSHOT_REQUIRED_MESSAGE=Please send the *payment screenshot* first. You'll get the QR once it's verified and you reply *DONE*
+SCREENSHOT_CHECKING_MESSAGE=🔍 Checking your payment screenshot…
+SCREENSHOT_STILL_CHECKING_MESSAGE=Still checking your screenshot, one moment…
+SCREENSHOT_VERIFIED_MESSAGE=✅ Payment of ₹{amount} verified! Reply *DONE* to get your QR
+SCREENSHOT_REVIEW_MESSAGE=Couldn't verify the screenshot automatically ({reason}). The seller is checking it now, you'll get a message here shortly.
+SCREENSHOT_RETRY_MESSAGE=❌ Couldn't verify this payment: {reason}.\nPlease send a clear screenshot of the *successful* UPI payment showing the amount, my UPI ID, time and UPI Ref/UTR. ({attemptsLeft} tries left)
+SCREENSHOT_NOT_IMAGE_MESSAGE=That doesn't look like a payment screenshot. Please send the screenshot of the successful UPI payment
+REVIEW_PENDING_MESSAGE=Your payment is being checked by the seller. Please wait a moment
+ADMIN_APPROVED_MESSAGE=✅ Seller confirmed your payment! Reply *DONE* to get your QR
+ADMIN_REJECTED_MESSAGE=❌ The seller couldn't confirm your payment. Please contact the seller directly.
+ADMIN_REVIEW_CAPTION=🔎 Payment needs your check\nBuyer: {buyerName} ({buyerPhone})\nExpected: ₹{expected}\nScreenshot: ₹{amount} to {payee}\nUTR: {utr}\nTime: {time}\nWhy: {reasons}\n\nReply *APPROVE* or *REJECT*
+TIMEOUT_FINAL_MESSAGE=Moved to next buyer. Reply *WANTS* if still interested
+SALE_CONFIRM_MESSAGE=Enjoy your {mealType}, {buyerName}!\n\n_Reply *TESTING* if not buying_
+TEST_REVERTED_MESSAGE=Got it! Thanks for letting me know
+NEGOTIATION_ACCEPTED_MESSAGE=✅ ₹{price} accepted!
+NEGOTIATION_DISABLED_MESSAGE=Sorry, price is fixed at ₹{price}. _negotiation is not possible_.
+NEGOTIATION_COUNTER_OFFER_MESSAGE=Best I can do right now is ₹{price}.
+PAY_VIA_PHONE_MESSAGE=Pay ₹{price} to same number or {UPI}
+

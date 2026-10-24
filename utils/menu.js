@@ -131,4 +131,19 @@ async function showMenu() {
     };
 }
 
-module.exports = { showMenu };
+/**
+ * Settings for unattended daily runs (AUTO_DAILY=true): no questions, just Setting.txt defaults.
+ */
+function defaultOptions() {
+    console.log(`🤖 AUTO_DAILY is on — selling ${config.DEFAULT_MESS} ${config.DEFAULT_MEAL} at ₹${config.DEFAULT_PRICE} every day (no setup questions).\n`);
+    return {
+        mode: 'SELLING',
+        ENABLE_NEGOTIATION: config.ENABLE_NEGOTIATION,
+        DEFAULT_PRICE: config.DEFAULT_PRICE,
+        _meal: config.DEFAULT_MEAL,
+        _mess: config.DEFAULT_MESS,
+        _numMessages: config.DEFAULT_NUM_MESSAGES,
+    };
+}
+
+module.exports = { showMenu, defaultOptions };

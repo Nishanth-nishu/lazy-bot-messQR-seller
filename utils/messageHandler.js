@@ -7,13 +7,21 @@ const config = require('./config');
 const { isBuyerKeyword, isDoneKeyword, isSellMessageSubstring } = require('./keywordMatcher');
 const { isBlockedWid, isBlockedContact } = require('./blocklist');
 const { extractPrice } = require('./priceParser');
-const { getCurrentPrice, stopScheduler, getCurrentMeal, restartScheduler } = require('./priceScheduler');
+const {
+    getCurrentPrice, stopScheduler, getCurrentMeal, restartScheduler, isListingLive, isWithinSaleWindow,
+} = require('./priceScheduler');
+const botSends = require('./botSends');
 const groupReactions = require('./groupReactions');
 const loyalty = require('./loyalty');
+const paymentVerifier = require('./paymentVerifier');
+const diningPortal = require('./diningPortal');
+const mediaDownload = require('./mediaDownload');
 
 // ─── State ──────────────────────────────────────────────────
 let sold = false;
-let currentBuyer = null;       // { id, name, phone, isFreeMeal, chatId, chat, assignedAt }
+// { id, name, phone, isFreeMeal, chatId, chat, assignedAt, agreedPrice,
+//   paymentState: 'awaiting' | 'verifying' | 'review' | 'verified', lastCheck }
+let currentBuyer = null;
 let queueTimer = null;         // Timer that triggers moving to next buyer
 let queueWarningTimer = null;  // Timer that warns current buyer before timeout
 let reactOwnGroupMessages = false;
@@ -32,44 +40,45 @@ let stats = {
 
 function isSold() { return sold; }
 
-function isPaymentSignal(msg, currentPrice) {
-    const type = (msg?.type || '').toLowerCase();
-    const body = (msg?.body || '').trim();
-    const bodyLower = body.toLowerCase();
+/**
+ * A buyer who has sent a screenshot (being checked, waiting for the seller,
+ * or already verified) has paid — never time them out or hand the meal to someone else.
+ */
+function buyerIsLocked() {
+    return Boolean(currentBuyer && currentBuyer.paymentState && currentBuyer.paymentState !== 'awaiting');
+}
 
-    const paymentTypeHit = type.includes('payment') || type.includes('pay');
+// ─── Chats the owner is handling personally ─────────────────
+// When you type to someone from your phone (not the bot), the bot keeps out of
+// that chat for MANUAL_PAUSE_MINUTES so it never "sells" to someone you're dealing with.
+const manualChats = new Map(); // chatId -> pause-until timestamp
 
-    const paymentTextHit = [
-        '₹',
-        'completed',
-        'sent to',
-        'sent to you',
-    ].some((pattern) => bodyLower.includes(pattern));
-
-    const hasRupeeSymbol = body.includes('₹');
-    const amount = extractRupeeAmount(body);
-    const amountEnough = amount !== null && currentPrice !== null && amount >= currentPrice;
-
-    if (paymentTypeHit) return true;
-    if (paymentTextHit) return true;
-    if (hasRupeeSymbol && amountEnough) return true;
-
+function isManualChat(chatId) {
+    const until = manualChats.get(chatId);
+    if (!until) return false;
+    if (Date.now() < until) return true;
+    manualChats.delete(chatId);
     return false;
 }
 
-function extractRupeeAmount(text) {
-    if (!text || typeof text !== 'string') return null;
+/** Call for every outgoing (fromMe) message; marks DMs you typed yourself. */
+async function noteOwnMessage(msg) {
+    if (!msg?.fromMe) return;
+    const chatId = (msg.id && typeof msg.id.remote === 'string' ? msg.id.remote : null) || msg.to;
+    if (!chatId || chatId.endsWith('@g.us') || chatId.endsWith('@broadcast') || chatId.endsWith('@newsletter')) return;
+    if (globalClient && chatId === globalClient.info?.wid?._serialized) return; // "Message yourself"
+    if (botSends.wasRecentlySentByBot(chatId)) return; // the bot's own message
 
-    const match = text.match(/₹\s*([0-9]+(?:\.[0-9]{1,2})?)/i);
-    if (!match) return null;
+    const firstTime = !isManualChat(chatId);
+    manualChats.set(chatId, Date.now() + config.MANUAL_PAUSE_MINUTES * 60 * 1000);
+    if (firstTime) console.log(`🤫 [Handler] You're chatting with ${chatId} yourself — bot stays out of that chat for ${config.MANUAL_PAUSE_MINUTES} min.`);
 
-    const amount = Number(match[1]);
-    return Number.isFinite(amount) ? amount : null;
-}
-
-function isWhatsAppPaySignal(msg) {
-    const type = (msg?.type || '').toLowerCase();
-    return type.includes('payment');
+    buyerQueue = buyerQueue.filter((b) => b.chatId !== chatId && b.id !== chatId);
+    if (currentBuyer && (currentBuyer.chatId === chatId || currentBuyer.id === chatId)) {
+        console.log(`🤫 [Handler] Handing ${currentBuyer.name} over to you.`);
+        releaseBuyer();
+        await tryNextBuyer();
+    }
 }
 
 /**
@@ -134,6 +143,10 @@ async function handleMessage(msg, client) {
         if (!body && msg._data) {
             body = msg._data.body || msg._data.caption || msg._data.text || '';
         }
+        // For photos/documents the body can be a base64 thumbnail — only the caption is text.
+        if (msg.hasMedia && msg.type !== 'chat') {
+            body = msg._data?.caption || '';
+        }
         body = (body || '').trim();
 
         let contact = null;
@@ -143,6 +156,9 @@ async function handleMessage(msg, client) {
             // Silently fallback if WhatsApp Web contact store is incomplete
         }
         const senderName = contact?.pushname || contact?.name || senderId;
+
+        // ── Seller/admin replying APPROVE or REJECT to a forwarded screenshot ──
+        if (await handleAdminCommand(msg, contact)) return;
 
         // A chat addressed by "@lid" hides the phone number in msg.from, so
         // re-check now that the contact has resolved it.
@@ -162,16 +178,26 @@ async function handleMessage(msg, client) {
         const me = client.info.wid._serialized;
         if (senderId === me) return;
 
-
+        // ── You're chatting with this person yourself — stay out of it ──
+        const chatId = chat?.id?._serialized || senderId;
+        if (isManualChat(chatId)) return;
 
         const quotedText = await getQuotedText(msg);
         const sellReplyMatch = isSellMessageSubstring(quotedText)
             ? quotedText
             : (isSellMessageSubstring(body) ? body : null);
 
+        // Only short, first-hand messages can start a purchase: forwarded posts, long
+        // texts (job ads, promos) and replies to some other message are not buyers.
+        const isForwardedMsg = Boolean(msg.isForwarded || msg._data?.isForwarded);
+        const quotesOtherMessage = Boolean(quotedText) && !isSellMessageSubstring(quotedText);
+        const tooLong = body.length > config.MAX_BUYER_MESSAGE_LENGTH;
+        const looksLikeBuyerMessage = !isForwardedMsg && !quotesOtherMessage && !tooLong;
+        const isCurrentBuyer = Boolean(currentBuyer && senderId === currentBuyer.id);
+
         stats.messagesReceived++;
         const quoteLog = quotedText ? ` (reply to: "${quotedText.replace(/\r?\n/g, ' ')}")` : '';
-        console.log(`📩 [Handler] DM from ${senderName}: "${body}"${quoteLog}`);
+        console.log(`📩 [Handler] DM from ${senderName}: "${body.length > 120 ? `${body.slice(0, 120)}…` : body}"${quoteLog}`);
 
         // ── Already sold ────────────────────────────────────────
         if (sold) {
@@ -180,6 +206,9 @@ async function handleMessage(msg, client) {
                 await revertSale(chat, senderName);
                 return;
             }
+
+            // Only answer "sold" to people plausibly asking about today's listing.
+            if (!looksLikeBuyerMessage || !isWithinSaleWindow()) return;
 
             const buyerKwSold = isBuyerKeyword(body);
             if (buyerKwSold || sellReplyMatch) {
@@ -192,8 +221,8 @@ async function handleMessage(msg, client) {
             return;
         }
 
-        // ── Current buyer says "done", sends screenshot, or payment-signal arrives ────────────────
-        if (currentBuyer && senderId === currentBuyer.id) {
+        // ── The current (first-in-line) buyer ────────────────────
+        if (isCurrentBuyer) {
             if (!currentBuyer.phone) {
                 const capturedPhone = extractPhoneNumberFromText(body);
                 if (capturedPhone) {
@@ -201,83 +230,105 @@ async function handleMessage(msg, client) {
                     console.log(`📱 [Handler] Captured buyer phone ${capturedPhone} from message text.`);
                 }
             }
-            const price = getCurrentPrice();
-            const doneKeyword = isDoneKeyword(body);
-            const paymentSignal = isPaymentSignal(msg, price);
-            const whatsappPaySignal = isWhatsAppPaySignal(msg);
-            const freeMealClaimKeyword = currentBuyer.isFreeMeal && (
-                doneKeyword ||
-                isBuyerKeyword(body) ||
-                sellReplyMatch ||
-                /^(ok|yes|claim|free|qr|dedo|bhejo|haan|send)$/i.test(body.trim())
-            );
+            currentBuyer.lastActivityAt = Date.now();
+            await handleCurrentBuyerMessage(msg, chat, senderName, body, sellReplyMatch);
+            return;
+        }
 
-            if (whatsappPaySignal || msg.hasMedia || doneKeyword || paymentSignal || freeMealClaimKeyword) {
-                if (currentBuyer.isFreeMeal) {
-                    console.log(`🎁 [Loyalty] Free meal claim signal from ${senderName}: "${body}"`);
-                } else if (whatsappPaySignal) {
-                    console.log(`💳 [Handler] WhatsApp Pay signal detected for ${senderName}.`);
-                } else if (paymentSignal) {
-                    console.log(`💳 [Handler] Payment signal detected for ${senderName} (type: ${msg.type || 'unknown'}).`);
-                } else if (msg.hasMedia) {
-                    console.log(`📸 [Handler] Media (screenshot) received from ${senderName}.`);
-                } else if (doneKeyword) {
-                    console.log(`💬 [Handler] "Done" keyword detected for ${senderName}: "${doneKeyword}"`);
-                }
-                await completeSale(chat, senderName);
-                return;
+        // ── New buyers only while a listing is up, and only from buyer-like messages ──
+        if (!isListingLive() || !looksLikeBuyerMessage) {
+            if (isBuyerKeyword(body) || sellReplyMatch) {
+                const why = !isListingLive() ? 'no listing is live right now'
+                    : isForwardedMsg ? 'forwarded message'
+                        : quotesOtherMessage ? 'reply to a different message'
+                            : 'message too long';
+                console.log(`🙈 [Handler] Ignored ${senderName}: ${why}.`);
             }
+            return;
         }
 
-        // ── Check if this message is a reply to the sell template ──
-        const isQuotedSellMsg = isSellMessageSubstring(quotedText);
-        let replyContent = body;
-        if (!isQuotedSellMsg && isSellMessageSubstring(body)) {
-            // Strip the template part so the original @<price> is not mistaken for a counter-offer
-            replyContent = body.replace(/Sell\s+[\w\s]+@(₹\s*)?\d+/i, '').trim();
-        }
-
-        // Check if there is an integer (number) in the user's reply/text
-        const hasIntegerInReply = sellReplyMatch ? /\d+/.test(replyContent) : false;
-        const offeredPrice = extractPrice(replyContent);
-
-        // A user is attempting to negotiate if:
-        // 1. They replied to the sell message and their reply text contains an integer, OR
-        // 2. Their direct message contains a recognized price offer.
-        const isNegotiationAttempt = (sellReplyMatch && hasIntegerInReply) || (!sellReplyMatch && offeredPrice !== null);
-
-        if (isNegotiationAttempt) {
-            if (config.ENABLE_NEGOTIATION) {
-                const priceToEvaluate = offeredPrice !== null ? offeredPrice : parseInt(replyContent.match(/\d+/)[0], 10);
-                if (Number.isFinite(priceToEvaluate) && priceToEvaluate > 0) {
-                    await handleNegotiation(chat, senderId, senderName, priceToEvaluate, contact);
-                    return;
-                }
-            } else {
-                await handleNegotiationDisabled(chat, senderId, senderName, contact);
-                return;
-            }
-        }
-
-        // ── Buyer keyword OR Non-negotiation Sell message reply ─────────────────
+        // ── Someone wants it: the first one gets it, everyone else waits in line ──
         const buyerKw = isBuyerKeyword(body);
-        if (buyerKw || sellReplyMatch) {
-            const trigger = buyerKw
-                ? `keyword: "${buyerKw}"`
-                : `sell message reply ("${sellReplyMatch.slice(0, 40)}")`;
-            console.log(`🎯 [Handler] Buyer intent triggered by ${trigger}`);
-            await handleBuyerIntent(chat, senderId, senderName, client, contact);
-            return;
-        }
-
-        // ── Unrecognized message from current buyer ─────────────
-        if (currentBuyer && senderId === currentBuyer.id) {
-            await chat.sendMessage(config.unrecognizedMessage());
-            console.log(`❓ [Handler] Sent unrecognized-message prompt to ${senderName}.`);
-            return;
+        const offer = offerFrom(body);
+        const asksForLess = NEGOTIATION_REQUEST_RE.test(body);
+        if (buyerKw || sellReplyMatch || offer !== null || asksForLess) {
+            const trigger = buyerKw ? `keyword: "${buyerKw}"` : sellReplyMatch ? 'reply to sell message' : 'price offer';
+            console.log(`🎯 [Handler] Buyer intent from ${senderName} (${trigger})`);
+            await handleBuyerIntent(chat, senderId, senderName, client, contact,
+                offer !== null ? offer : (asksForLess ? null : undefined));
         }
     } catch (err) {
         console.error('❌ [Handler] Error processing message:', err.message);
+    }
+}
+
+/** A price someone offers in a message ("20?", "₹15 ok"), ignoring times like 7:45. */
+function offerFrom(text) {
+    const cleaned = String(text || '')
+        .replace(/Sell\s+[\w\s()]+@(₹\s*)?\d+/i, '')
+        .replace(/\d{1,2}[:.]\d{2}\s*(am|pm)?/gi, '')
+        .replace(/\d{6,}/g, '');
+    return extractPrice(cleaned);
+}
+
+/** Everything the first-in-line buyer says goes through here. */
+async function handleCurrentBuyerMessage(msg, chat, senderName, body, sellReplyMatch) {
+    const buyer = currentBuyer;
+
+    if (buyer.isFreeMeal) {
+        if (isDoneKeyword(body) || isConfirmation(body) || isBuyerKeyword(body) || sellReplyMatch
+            || /^(claim|free|qr|dedo|bhejo|send)$/i.test(body.trim())) {
+            console.log(`🎁 [Loyalty] Free meal claim signal from ${senderName}: "${body}"`);
+            await completeSale(chat, senderName);
+        }
+        return;
+    }
+
+    if (msg.hasMedia) {
+        await handleScreenshot(msg, chat, senderName);
+        return;
+    }
+
+    const state = buyer.paymentState;
+    if (state === 'verified') {
+        if (isDoneKeyword(body) || isConfirmation(body)) await completeSale(chat, senderName);
+        else await chat.sendMessage(config.screenshotVerifiedMessage(buyer.agreedPrice));
+        return;
+    }
+    if (state === 'verifying') {
+        if (isDoneKeyword(body)) await chat.sendMessage(config.screenshotStillCheckingMessage());
+        return;
+    }
+    if (state === 'review') {
+        if (isDoneKeyword(body)) await chat.sendMessage(config.reviewPendingMessage());
+        return;
+    }
+
+    const offer = offerFrom(body);
+    const asksForLess = NEGOTIATION_REQUEST_RE.test(body);
+
+    if (state === 'confirmed') {
+        // Price is agreed and the meal is held — no more bargaining.
+        if (offer !== null && offer !== buyer.agreedPrice) {
+            await chat.sendMessage(config.priceLockedMessage(buyer.agreedPrice));
+        } else if (asksForLess) {
+            await chat.sendMessage(config.priceLockedMessage(buyer.agreedPrice));
+        } else if (isDoneKeyword(body)) {
+            await chat.sendMessage(config.screenshotRequiredMessage());
+        }
+        return;
+    }
+
+    // state === 'awaiting': price offered, buyer hasn't said yes yet
+    if (offer !== null && offer !== buyer.agreedPrice) {
+        await handleNegotiation(buyer, offer);
+    } else if (asksForLess && !isConfirmation(body)) {
+        await handleNegotiation(buyer, null);
+    } else if (isConfirmation(body) || isDoneKeyword(body) || offer === buyer.agreedPrice) {
+        await confirmPurchase(buyer, `said "${body.slice(0, 30)}"`);
+    } else {
+        await askToConfirm(buyer);
+        console.log(`❓ [Handler] Reminded ${senderName} to confirm ₹${buyer.agreedPrice}.`);
     }
 }
 
@@ -285,41 +336,35 @@ async function handleMessage(msg, client) {
 //  BUYER INTENT
 // ═══════════════════════════════════════════════════════════════
 
-async function handleBuyerIntent(chat, senderId, senderName, client, contact = null) {
-    // Already the current buyer
-    if (currentBuyer && currentBuyer.id === senderId) {
-        console.log(`ℹ️  [Handler] ${senderName} is already the current buyer.`);
-        return;
-    }
+/**
+ * Someone wants the meal. The first one becomes the current buyer; everyone after
+ * waits silently in line (with any offer they made remembered for their turn).
+ * `offer`: a number they offered, null if they just asked for less, undefined otherwise.
+ */
+async function handleBuyerIntent(chat, senderId, senderName, client, contact = null, offer = undefined) {
+    if (currentBuyer && currentBuyer.id === senderId) return;
 
-    // No current buyer → assign directly
     if (!currentBuyer) {
-        await assignBuyer(chat, senderId, senderName, contact);
+        await assignBuyer(chat, senderId, senderName, contact, offer);
         return;
     }
 
-    // There IS a current buyer — a second buyer has arrived
-    const elapsed = Date.now() - currentBuyer.assignedAt;
-
-    if (elapsed < config.BUYER_INACTIVITY_MS) {
-        // ── Within 90s window → queue new buyer and schedule timeout ──
-        const alreadyQueued = buyerQueue.some((b) => b.id === senderId);
-        if (!alreadyQueued) {
-            buyerQueue.push({ id: senderId, name: senderName, chatId: chat.id._serialized, contact });
-            console.log(`🔢 [Handler] ${senderName} queued (position ${buyerQueue.length}).`);
-        }
-
-        scheduleNextBuyer(config.BUYER_INACTIVITY_MS - elapsed);
+    const queued = buyerQueue.find((b) => b.id === senderId);
+    if (queued) {
+        if (offer !== undefined) queued.offer = offer;
     } else {
-        // ── After 90s window → immediate move to next buyer ──
-        console.log(`⏱️  [Handler] ${currentBuyer.name} exceeded 90s window. Sending timeout msg & assigning new buyer.`);
+        buyerQueue.push({ id: senderId, name: senderName, chatId: chat.id._serialized, contact, offer });
+        console.log(`🔢 [Handler] ${senderName} waiting in line (position ${buyerQueue.length}) behind ${currentBuyer.name}.`);
+    }
 
-        const alreadyQueued = buyerQueue.some((b) => b.id === senderId);
-        if (!alreadyQueued) {
-            buyerQueue.push({ id: senderId, name: senderName, chatId: chat.id._serialized, contact });
-        }
-
+    // The first buyer keeps priority while they're responsive or have committed to pay.
+    if (buyerIsLocked()) return;
+    const idleMs = Date.now() - (currentBuyer.lastActivityAt || currentBuyer.assignedAt);
+    if (idleMs >= config.BUYER_INACTIVITY_MS) {
+        console.log(`⏱️  [Handler] ${currentBuyer.name} went quiet for ${Math.round(idleMs / 1000)}s — offering to the next buyer.`);
         await moveNextBuyer();
+    } else {
+        scheduleNextBuyer(config.BUYER_INACTIVITY_MS - idleMs);
     }
 }
 
@@ -403,14 +448,13 @@ async function resolveBuyerPhoneAsync(contact, senderId, chat = null) {
 //  ASSIGN BUYER
 // ═══════════════════════════════════════════════════════════════
 
-async function assignBuyer(chat, senderId, senderName, contact = null, agreedPrice = null) {
+async function assignBuyer(chat, senderId, senderName, contact = null, offer = undefined) {
     const buyerPhone = await resolveBuyerPhoneAsync(contact, senderId, chat);
     const freeEligible = buyerPhone
         ? loyalty.isFreeMealEligible(config.LOYALTY_CSV_PATH, buyerPhone, config.LOYALTY_TARGET)
         : false;
     const price = getCurrentPrice();
-    const safePrice = Number.isFinite(price) && price > 0 ? price : config.DEFAULT_PRICE;
-    const finalPrice = (Number.isFinite(agreedPrice) && agreedPrice > 0) ? agreedPrice : safePrice;
+    const listPrice = Number.isFinite(price) && price > 0 ? price : config.DEFAULT_PRICE;
 
     currentBuyer = {
         id: senderId,
@@ -420,8 +464,16 @@ async function assignBuyer(chat, senderId, senderName, contact = null, agreedPri
         chatId: chat.id._serialized,
         chat,
         assignedAt: Date.now(),
-        agreedPrice: finalPrice,
+        lastActivityAt: Date.now(),
+        listPrice,
+        agreedPrice: listPrice,
+        quotedAt: Date.now(),      // payment must happen after the final price is quoted…
+        confirmedAt: null,         // …and within PAYMENT_WINDOW_MINUTES of the deal
+        paymentState: 'awaiting',
+        paymentTimer: null,
+        lastCheck: null,
     };
+    const finalPrice = listPrice;
     console.log(`🛒 [Handler] Buyer assigned: ${senderName} (phone: ${buyerPhone || 'unresolved'}, freeEligible: ${freeEligible}, price: ₹${finalPrice})`);
 
     try {
@@ -432,7 +484,16 @@ async function assignBuyer(chat, senderId, senderName, contact = null, agreedPri
             await sendTextWithFallbacks(chat, buyerPhone, senderId, config.payViaPhoneMessage(finalPrice, config.UPI_ID));
             console.log('📤 [Handler] Payment details sent.');
 
-            await sendTextWithFallbacks(chat, buyerPhone, senderId, config.paymentInstructionMessage());
+            if (config.UPI_QR_IMAGE_PATH && fs.existsSync(config.UPI_QR_IMAGE_PATH)) {
+                const upiSent = await sendMediaWithFallbacks(chat, buyerPhone, senderId, config.UPI_QR_IMAGE_PATH);
+                console.log(upiSent ? '📤 [Handler] UPI payment QR sent.' : '⚠️  [Handler] UPI payment QR could not be sent.');
+            }
+
+            if (offer !== undefined) {
+                await handleNegotiation(currentBuyer, offer); // they already asked for a lower price
+            } else {
+                await sendTextWithFallbacks(chat, buyerPhone, senderId, config.paymentInstructionMessage(finalPrice));
+            }
             console.log('📤 [Handler] Payment instruction sent.');
         }
     } catch (err) {
@@ -459,7 +520,7 @@ function scheduleNextBuyer(delayMs) {
     if (warningDelayMs > 0 && currentBuyer?.chat && buyerQueue.length > 0) {
         queueWarningTimer = setTimeout(async () => {
             queueWarningTimer = null;
-            if (sold || !currentBuyer) return;
+            if (sold || !currentBuyer || buyerIsLocked()) return;
             if (!warningBuyerId || currentBuyer.id !== warningBuyerId) return;
             if (buyerQueue.length === 0) return;
             if (isBlockedWid(currentBuyer.id)) return; // blocked mid-purchase
@@ -484,6 +545,10 @@ function scheduleNextBuyer(delayMs) {
 
 async function moveNextBuyer() {
     if (!currentBuyer) return;
+    if (buyerIsLocked()) {
+        console.log(`🔒 [Handler] ${currentBuyer.name} has sent a payment screenshot (${currentBuyer.paymentState}) — keeping them, not moving on.`);
+        return;
+    }
 
     if (isBlockedWid(currentBuyer.id)) {
         console.log(`⛔ [Blocklist] ${currentBuyer.name} was blocked mid-purchase — dropping silently.`);
@@ -526,6 +591,7 @@ async function removeAllTrackedReactions() {
 
 function releaseBuyer() {
     clearAllTimers();
+    if (currentBuyer?.paymentTimer) clearTimeout(currentBuyer.paymentTimer);
     currentBuyer = null;
     console.log('🔄 [Handler] Buyer reservation released.');
 }
@@ -547,7 +613,7 @@ async function tryNextBuyer() {
 
     try {
         const chat = await globalClient.getChatById(next.chatId);
-        await assignBuyer(chat, next.id, next.name, next.contact || null, next.agreedPrice || null);
+        await assignBuyer(chat, next.id, next.name, next.contact || null, next.offer);
     } catch (err) {
         console.error('❌ [Handler] Error assigning next buyer:', err.message);
         await tryNextBuyer();
@@ -558,96 +624,137 @@ async function tryNextBuyer() {
 //  NEGOTIATION
 // ═══════════════════════════════════════════════════════════════
 
-async function handleNegotiation(chat, senderId, senderName, offeredPrice, contact = null) {
-    stats.negotiations++;
-    const price = getCurrentPrice();
+// Only the current (first-in-line) buyer can negotiate, and only when they ask.
+// How low the bot will go depends on the time — NEGOTIATION_SCHEDULE in Setting.txt,
+// e.g. "07:30=none, 08:30=20, 09:00=15, 09:15=10" (none = price is fixed).
 
-    if (price === null) {
-        console.log(`💬 [Handler] Negotiation from ${senderName}: ₹${offeredPrice} — no active price, ignoring.`);
+const NEGOTIATION_REQUEST_RE = /\b(less|lesser|reduce|discount|kam|kum|lower|cheaper|best price|last price|final price|negotiable|negotiate|bargain|can you do|can u do|any offer)\b/i;
+const CONFIRM_WORDS_RE = /^(y|yes+|yeah|yea|yep|yup|ya+|haan|han|ha|ok+|okay|okk+|k|sure|confirm(ed)?|deal|done deal|go ahead|fine|paying|will pay|i will pay|i'?ll pay|i'?m paying|sending|sending now|paying now)\b/i;
+const CONFIRM_EMOJI = ['👍', '👌', '✅', '🙏', '🤝', '💯', '✔', '☑'];
+
+/** Lowest acceptable price right now, or null when the price is fixed. */
+function negotiationFloor(listPrice, when = new Date()) {
+    if (!config.ENABLE_NEGOTIATION) return null;
+    if (config.TESTING) return Math.max(listPrice - config.NEGOTIATION_MARGIN, 0);
+
+    const minutes = when.getHours() * 60 + when.getMinutes();
+    let floor = null;
+    for (const part of String(config.NEGOTIATION_SCHEDULE || '').split(',')) {
+        const m = /^\s*(\d{1,2}):(\d{2})\s*=\s*(none|\d+)\s*$/i.exec(part);
+        if (m && Number(m[1]) * 60 + Number(m[2]) <= minutes) floor = m[3].toLowerCase() === 'none' ? null : Number(m[3]);
+    }
+    return floor !== null && floor < listPrice ? floor : null;
+}
+
+function isConfirmation(text) {
+    const t = String(text || '').trim();
+    if (!t) return false;
+    if (CONFIRM_EMOJI.some((e) => t.startsWith(e))) return true;
+    return CONFIRM_WORDS_RE.test(t) || /\bpaying\b/i.test(t);
+}
+
+function isPositiveReaction(emoji) {
+    return CONFIRM_EMOJI.some((e) => String(emoji || '').startsWith(e)) || /^(❤|♥|😍|🔥|🫡)/u.test(String(emoji || ''));
+}
+
+/** Tell the current buyer the price on the table and ask them to confirm. */
+async function askToConfirm(buyer, intro = null) {
+    const text = [intro, config.confirmPromptMessage(buyer.agreedPrice)].filter(Boolean).join('\n');
+    await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id, text);
+}
+
+async function handleNegotiation(buyer, offeredPrice) {
+    stats.negotiations++;
+    const listPrice = buyer.listPrice;
+    const floor = negotiationFloor(listPrice);
+
+    if (floor === null) {
+        console.log(`💬 [Handler] ${buyer.name} asked to negotiate — price is fixed right now (₹${listPrice}).`);
+        buyer.agreedPrice = listPrice;
+        buyer.quotedAt = Date.now();
+        await askToConfirm(buyer, config.negotiationDisabledMessage(listPrice));
         return;
     }
 
-    const minAcceptable = price - config.NEGOTIATION_MARGIN;
-
-    if (offeredPrice >= minAcceptable) {
-        console.log(`✅ [Handler] Negotiation ACCEPTED: ${senderName} ₹${offeredPrice} (min: ₹${minAcceptable})`);
-        await sendTextWithFallbacks(chat, null, senderId, config.negotiationAcceptedMessage(offeredPrice));
-
-        if (!currentBuyer) {
-            await assignBuyer(chat, senderId, senderName, contact, offeredPrice);
-        } else if (currentBuyer.id === senderId) {
-            currentBuyer.agreedPrice = offeredPrice;
-            await sendTextWithFallbacks(chat, currentBuyer.phone, senderId, config.payViaPhoneMessage(offeredPrice, config.UPI_ID));
-            await sendTextWithFallbacks(chat, currentBuyer.phone, senderId, config.paymentInstructionMessage());
-        } else {
-            const alreadyQueued = buyerQueue.some((b) => b.id === senderId);
-            if (!alreadyQueued) {
-                buyerQueue.push({ id: senderId, name: senderName, chatId: chat.id._serialized, contact, agreedPrice: offeredPrice });
-            }
-
-            const elapsed = Date.now() - currentBuyer.assignedAt;
-            if (elapsed < config.BUYER_INACTIVITY_MS) {
-                scheduleNextBuyer(config.BUYER_INACTIVITY_MS - elapsed);
-            } else {
-                await moveNextBuyer();
-            }
-        }
+    let price;
+    let intro;
+    if (offeredPrice === null) {
+        price = floor; // "can you reduce?" — give the best price for this time
+        intro = config.negotiationCounterOfferMessage(price);
+    } else if (offeredPrice >= listPrice) {
+        price = listPrice;
+        intro = config.negotiationAcceptedMessage(price);
+    } else if (offeredPrice >= floor) {
+        price = offeredPrice;
+        intro = config.negotiationAcceptedMessage(price);
     } else {
-        console.log(`💬 [Handler] Negotiation below threshold from ${senderName}: offered ₹${offeredPrice} (counter-offering min: ₹${minAcceptable})`);
-        // 1. Ask politely that seller can accept up to minAcceptable
-        await sendTextWithFallbacks(chat, null, senderId, config.negotiationCounterOfferMessage(minAcceptable));
+        price = floor;
+        intro = config.negotiationCounterOfferMessage(price);
+    }
 
-        // 2 & 3. Send payment instruction & transaction notice via assignBuyer
-        if (!currentBuyer) {
-            await assignBuyer(chat, senderId, senderName, contact, minAcceptable);
-        } else if (currentBuyer.id === senderId) {
-            currentBuyer.agreedPrice = minAcceptable;
-            await sendTextWithFallbacks(chat, currentBuyer.phone, senderId, config.payViaPhoneMessage(minAcceptable, config.UPI_ID));
-            await sendTextWithFallbacks(chat, currentBuyer.phone, senderId, config.paymentInstructionMessage());
-        } else {
-            const alreadyQueued = buyerQueue.some((b) => b.id === senderId);
-            if (!alreadyQueued) {
-                buyerQueue.push({ id: senderId, name: senderName, chatId: chat.id._serialized, contact, agreedPrice: minAcceptable });
-            }
+    console.log(`💬 [Handler] Negotiation with ${buyer.name}: offered ${offeredPrice === null ? '(asked for less)' : `₹${offeredPrice}`} → ₹${price} (list ₹${listPrice}, floor ₹${floor}).`);
+    buyer.agreedPrice = price;
+    buyer.quotedAt = Date.now();
+    buyer.paymentState = 'awaiting';
+    buyer.confirmedAt = null;
+    await askToConfirm(buyer, intro);
+}
 
-            const elapsed = Date.now() - currentBuyer.assignedAt;
-            if (elapsed < config.BUYER_INACTIVITY_MS) {
-                scheduleNextBuyer(config.BUYER_INACTIVITY_MS - elapsed);
-            } else {
-                await moveNextBuyer();
-            }
-        }
+/** Buyer said yes / paying / 👍 — hold the meal for them and start the payment window. */
+async function confirmPurchase(buyer, how) {
+    if (!buyer || buyer.paymentState !== 'awaiting') return;
+    buyer.paymentState = 'confirmed';
+    buyer.confirmedAt = Date.now();
+    clearAllTimers(); // nobody else gets the meal while they pay
+
+    if (buyer.paymentTimer) clearTimeout(buyer.paymentTimer);
+    const holdMs = (config.PAYMENT_WINDOW_MINUTES + config.SCREENSHOT_GRACE_MINUTES) * 60 * 1000;
+    buyer.paymentTimer = setTimeout(() => expirePaymentWindow(buyer), holdMs);
+
+    console.log(`🤝 [Handler] ${buyer.name} confirmed (${how}) at ₹${buyer.agreedPrice}. Holding the meal for ${config.PAYMENT_WINDOW_MINUTES} min (+${config.SCREENSHOT_GRACE_MINUTES} for the screenshot); ${buyerQueue.length} waiting.`);
+    await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id,
+        config.confirmedMessage(buyer.agreedPrice, config.PAYMENT_WINDOW_MINUTES));
+}
+
+async function expirePaymentWindow(buyer) {
+    if (sold || currentBuyer !== buyer) return;
+    if (buyer.paymentState === 'verifying' || buyer.paymentState === 'review') {
+        buyer.paymentTimer = setTimeout(() => expirePaymentWindow(buyer), 2 * 60 * 1000); // still being checked
+        return;
+    }
+    if (buyer.paymentState !== 'confirmed') return; // verified (waiting for DONE) or already moved on
+
+    console.log(`⌛ [Handler] ${buyer.name}'s payment window ran out — moving to the next buyer.`);
+    await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id, config.paymentWindowExpiredMessage(config.PAYMENT_WINDOW_MINUTES));
+    releaseBuyer();
+    await tryNextBuyer();
+}
+
+/** 👍 (or similar) on one of our messages counts as "yes, paying". */
+async function handleReaction(reaction) {
+    try {
+        if (!currentBuyer || sold || currentBuyer.paymentState !== 'awaiting') return;
+        if (reaction?.id?.fromMe) return;
+        const chatId = reaction?.msgId?.remote?._serialized || reaction?.msgId?.remote || reaction?.id?.remote;
+        const sameChat = chatId === currentBuyer.chatId || chatId === currentBuyer.id || reaction?.senderId === currentBuyer.id;
+        if (!sameChat || !isPositiveReaction(reaction.reaction)) return;
+        await confirmPurchase(currentBuyer, `reacted ${reaction.reaction}`);
+    } catch (err) {
+        console.error('❌ [Handler] Error handling reaction:', err.message);
     }
 }
 
-async function handleNegotiationDisabled(chat, senderId, senderName, contact = null) {
-    const price = getCurrentPrice();
-    const safePrice = Number.isFinite(price) && price > 0 ? price : config.DEFAULT_PRICE;
-
-    console.log(`💬 [Handler] Negotiation attempt from ${senderName} while negotiation is OFF: informing fixed price ₹${safePrice}.`);
-    // 1. Respond politely that negotiation is not possible
-    await sendTextWithFallbacks(chat, null, senderId, config.negotiationDisabledMessage(safePrice));
-
-    // 2 & 3. Send payment details and transaction instruction via assignBuyer
-    if (!currentBuyer) {
-        await assignBuyer(chat, senderId, senderName, contact, safePrice);
-    } else if (currentBuyer.id === senderId) {
-        currentBuyer.agreedPrice = safePrice;
-        await sendTextWithFallbacks(chat, currentBuyer.phone, senderId, config.payViaPhoneMessage(safePrice, config.UPI_ID));
-        await sendTextWithFallbacks(chat, currentBuyer.phone, senderId, config.paymentInstructionMessage());
-    } else {
-        const alreadyQueued = buyerQueue.some((b) => b.id === senderId);
-        if (!alreadyQueued) {
-            buyerQueue.push({ id: senderId, name: senderName, chatId: chat.id._serialized, contact, agreedPrice: safePrice });
-        }
-
-        const elapsed = Date.now() - currentBuyer.assignedAt;
-        if (elapsed < config.BUYER_INACTIVITY_MS) {
-            scheduleNextBuyer(config.BUYER_INACTIVITY_MS - elapsed);
-        } else {
-            await moveNextBuyer();
+/** After a sale, let everyone still waiting know it's gone. */
+async function notifyQueueSold() {
+    const waiting = buyerQueue.splice(0);
+    for (const b of waiting) {
+        try {
+            await globalClient.sendMessage(b.chatId, config.soldMessage());
+        } catch (err) {
+            console.warn(`⚠️  [Handler] Could not tell ${b.name} it's sold: ${err.message}`);
         }
     }
+    if (waiting.length) console.log(`📣 [Handler] Told ${waiting.length} waiting buyer(s) it's sold.`);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -722,6 +829,7 @@ async function sendMediaWithFallbacks(chat, buyerPhone, senderId, mediaPath) {
 
     // Attempt 3: Direct browser evaluate fallback using active chat ID
     if (globalClient?.pupPage && chatId) {
+        botSends.record(chatId); // bypasses client.sendMessage, so note it ourselves
         try {
             const directSent = await globalClient.pupPage.evaluate(async (targetChatId, mediaData) => {
                 const targetChat = await window.WWebJS.getChat(targetChatId, { getAsModel: false });
@@ -780,6 +888,204 @@ async function sendTextWithFallbacks(chat, buyerPhone, senderId, textMessage) {
     }
 
     return false;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PAYMENT VERIFICATION
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Buyer sent media: download it, have Claude read it, and either mark the
+ * payment verified or hand it to the admin for a manual decision.
+ */
+async function handleScreenshot(msg, chat, buyerName) {
+    const buyer = currentBuyer;
+
+    if (buyer.paymentState === 'verifying') {
+        await chat.sendMessage(config.screenshotStillCheckingMessage());
+        return;
+    }
+    if (buyer.paymentState === 'verified') {
+        await chat.sendMessage(config.screenshotVerifiedMessage(buyer.agreedPrice));
+        return;
+    }
+
+    let media = null;
+    try {
+        media = await msg.downloadMedia();
+    } catch (err) {
+        console.warn(`⚠️  [Verifier] WhatsApp Web could not download media from ${buyerName}: ${err.message}`);
+    }
+    if (!media?.data) {
+        try {
+            media = await mediaDownload.downloadDecrypted(msg);
+            if (media) console.log(`📥 [Verifier] Downloaded screenshot from ${buyerName} directly.`);
+        } catch (err) {
+            console.warn(`⚠️  [Verifier] Direct media download failed for ${buyerName}: ${err.message}`);
+        }
+    }
+    const mimeType = (media?.mimetype || '').split(';')[0].trim().toLowerCase();
+    if (!media?.data || !paymentVerifier.SUPPORTED_IMAGE_TYPES.includes(mimeType)) {
+        await chat.sendMessage(config.screenshotNotImageMessage());
+        return;
+    }
+
+    console.log(`📸 [Verifier] Screenshot received from ${buyerName}. Checking…`);
+    buyer.paymentState = 'verifying';
+    clearAllTimers();
+    await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.screenshotCheckingMessage());
+
+    // Paid exactly the agreed price, after the price was quoted and within the payment window.
+    const dealAt = buyer.confirmedAt || buyer.quotedAt || buyer.assignedAt;
+    const result = await paymentVerifier.verifyScreenshot(media, {
+        amount: buyer.agreedPrice,
+        notBefore: new Date(buyer.quotedAt || buyer.assignedAt),
+        notAfter: new Date(dealAt + config.PAYMENT_WINDOW_MINUTES * 60 * 1000),
+    });
+    if (sold || currentBuyer !== buyer) return; // buyer changed while the screenshot was being read
+    buyer.lastCheck = result;
+
+    if (result.verified) {
+        await markPaymentVerified(chat, buyerName, result.details.amount, 'screenshot', result.details.transaction_id);
+        return;
+    }
+
+    // Claude couldn't run at all (no credits, network…) — only a human can decide.
+    if (result.error) {
+        buyer.paymentState = 'review';
+        const forwarded = await forwardToAdmin(buyer, media, result);
+        await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.screenshotReviewMessage(result.reasons.join('; ')));
+        console.warn(`⚠️  [Verifier] Automatic check unavailable for ${buyerName}${forwarded ? ' — sent to admin' : ''}.`);
+        return;
+    }
+
+    // The screenshot failed a check — no waiting on the seller: tell the buyer why and let them resend.
+    buyer.paymentState = buyer.confirmedAt ? 'confirmed' : 'awaiting';
+    buyer.failedChecks = (buyer.failedChecks || 0) + 1;
+    forwardToAdmin(buyer, media, result).catch(() => {}); // FYI only; the admin can still APPROVE later
+
+    if (buyer.failedChecks >= config.MAX_VERIFY_ATTEMPTS) {
+        console.log(`🚫 [Verifier] ${buyerName} failed ${buyer.failedChecks} screenshot checks — moving to the next buyer.`);
+        await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.adminRejectedMessage());
+        releaseBuyer();
+        await tryNextBuyer();
+        return;
+    }
+
+    const reasons = result.details && !result.details.is_payment_screenshot
+        ? 'that is not a payment screenshot'
+        : result.reasons.join('; ');
+    await sendTextWithFallbacks(chat, buyer.phone, buyer.id,
+        config.screenshotRetryMessage(reasons, config.MAX_VERIFY_ATTEMPTS - buyer.failedChecks));
+    console.log(`🔁 [Verifier] Asked ${buyerName} to resend (${buyer.failedChecks}/${config.MAX_VERIFY_ATTEMPTS}): ${reasons}`);
+}
+
+async function markPaymentVerified(chat, buyerName, amount, method, utr) {
+    const buyer = currentBuyer;
+    if (!buyer) return;
+    buyer.paymentState = 'verified';
+    clearAllTimers();
+
+    try {
+        paymentVerifier.recordUtr({ utr, phone: buyer.phone, name: buyerName, amount, method });
+    } catch (err) {
+        console.error('❌ [Verifier] Could not record transaction ID:', err.message);
+    }
+
+    const shownAmount = Number.isFinite(amount) ? amount : buyer.agreedPrice;
+    const text = method === 'admin' ? config.adminApprovedMessage() : config.screenshotVerifiedMessage(shownAmount);
+    await sendTextWithFallbacks(chat, buyer.phone, buyer.id, text);
+    console.log(`✅ [Verifier] Payment from ${buyerName} verified (${method}). Waiting for DONE.`);
+}
+
+function getAdminJid() {
+    const adminPhone = loyalty.normalizePhoneNumber(config.ADMIN_NUMBER);
+    return adminPhone ? `91${adminPhone}@c.us` : null;
+}
+
+async function forwardToAdmin(buyer, media, result) {
+    const adminJid = getAdminJid();
+    if (!adminJid || !globalClient) return false;
+
+    const d = result.details || {};
+    const caption = config.adminReviewCaption({
+        buyerName: buyer.name,
+        buyerPhone: buyer.phone || 'unknown',
+        expected: buyer.agreedPrice,
+        amount: d.amount ?? '?',
+        payee: d.payee_upi || d.payee_name || '?',
+        utr: d.transaction_id || '?',
+        time: d.payment_datetime || '?',
+        reasons: result.reasons.join('; '),
+    });
+
+    try {
+        await globalClient.sendMessage(adminJid, new MessageMedia(media.mimetype, media.data, media.filename), { caption });
+        return true;
+    } catch (err) {
+        console.warn(`⚠️  [Verifier] Could not send screenshot to admin: ${err.message}`);
+    }
+    try {
+        await globalClient.sendMessage(adminJid, `${caption}\n\n(Screenshot could not be attached — check ${buyer.name}'s chat.)`);
+        return true;
+    } catch (err) {
+        console.error('❌ [Verifier] Could not reach admin:', err.message);
+        return false;
+    }
+}
+
+/**
+ * Admin replies APPROVE or REJECT (exact word) to settle a screenshot under review.
+ * Works from the admin's own number, or from this account's "Message yourself"
+ * chat when ADMIN_NUMBER is the bot's own number. Returns true if handled.
+ */
+async function handleAdminCommand(msg, contact = null) {
+    const body = (msg?.body || '').trim();
+    const match = body.match(/^(approve|reject)$/i);
+    if (!match || !globalClient) return false;
+
+    const adminPhone = loyalty.normalizePhoneNumber(config.ADMIN_NUMBER);
+    if (!adminPhone) return false;
+
+    let replyTo;
+    if (msg.fromMe) {
+        const myPhone = loyalty.normalizePhoneNumber(globalClient.info?.wid?.user);
+        const chatId = (msg.id && typeof msg.id.remote === 'string' ? msg.id.remote : null) || msg.to;
+        const isSelfChat = chatId === globalClient.info?.wid?._serialized || loyalty.widToPhoneNumber(chatId) === myPhone;
+        if (myPhone !== adminPhone || !isSelfChat) return false;
+        replyTo = chatId;
+    } else {
+        const senderPhone = await resolveBuyerPhoneAsync(contact, msg.from, null);
+        if (senderPhone !== adminPhone) return false;
+        replyTo = msg.from;
+    }
+
+    const reply = async (text) => {
+        try { await globalClient.sendMessage(replyTo, text); } catch (_) { /* best effort */ }
+    };
+
+    // 'review' = waiting on the admin; 'awaiting' with a failed check = bot asked for a resend, admin may overrule.
+    const decidable = currentBuyer && (currentBuyer.paymentState === 'review'
+        || (currentBuyer.paymentState === 'awaiting' && currentBuyer.lastCheck));
+    if (!decidable) {
+        await reply('No payment screenshot is waiting for approval.');
+        return true;
+    }
+
+    const buyer = currentBuyer;
+    if (match[1].toLowerCase() === 'approve') {
+        const d = buyer.lastCheck?.details || {};
+        await markPaymentVerified(buyer.chat, buyer.name, d.amount, 'admin', d.transaction_id);
+        await reply(`✅ Approved ${buyer.name}. They'll get the QR after replying DONE.`);
+        console.log(`👮 [Admin] Approved payment from ${buyer.name}.`);
+    } else {
+        await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id, config.adminRejectedMessage());
+        await reply(`❌ Rejected ${buyer.name}. Moving to the next buyer.`);
+        console.log(`👮 [Admin] Rejected payment from ${buyer.name}.`);
+        releaseBuyer();
+        await tryNextBuyer();
+    }
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -856,7 +1162,11 @@ async function completeSale(chat, buyerName) {
     // ── 2. Deliver QR Media Resiliently ──────────────────────────────────
     let qrDelivered = false;
     try {
+        // The portal QR can change; grab the current one right before handing it over.
+        if (diningPortal.isConfigured()) await diningPortal.refreshQr('before delivery');
         qrDelivered = await sendMediaWithFallbacks(chat, buyerPhone, senderId, config.QR_IMAGE_PATH);
+        if (currentBuyer?.paymentTimer) clearTimeout(currentBuyer.paymentTimer);
+        await notifyQueueSold();
     } catch (qrErr) {
         console.error('❌ [Handler] Error in QR delivery pipeline:', qrErr.message);
     }
@@ -920,6 +1230,13 @@ async function revertSale(chat, buyerName) {
 }
 
 function handleUnsoldStop() {
+    if (currentBuyer) {
+        // Someone is mid-purchase at the cut-off — stop posting, but let them finish paying.
+        console.log(`⏳ [Handler] Window closed while ${currentBuyer.name} is mid-purchase (${currentBuyer.paymentState}) — letting them finish.`);
+        buyerQueue = [];
+        clearAllTimers();
+        return;
+    }
     sold = true;
     reactOwnGroupMessages = false;
     allowTestingRevert = false;
@@ -936,17 +1253,41 @@ function printReport() {
 
     console.log(`
 ═════════════════════════════════════════════
-          SALE REPORT                   
+          SALE REPORT
 ═════════════════════════════════════════════
-  Date:              ${date.padEnd(14)}     
-  Sold:              ${(wasSold ? 'Yes' : 'No').padEnd(14)}     
+  Date:              ${date.padEnd(14)}
+  Sold:              ${(wasSold ? 'Yes' : 'No').padEnd(14)}
   Sold Price:        ${soldPriceDisplay.padEnd(14)}
-  Buyer Name:        ${(stats.buyerName || '—').padEnd(14)}     
-  Time Sold:         ${(stats.timeSold || '—').padEnd(14)}     
-  Messages Received: ${String(stats.messagesReceived).padEnd(14)}     
+  Buyer Name:        ${(stats.buyerName || '—').padEnd(14)}
+  Time Sold:         ${(stats.timeSold || '—').padEnd(14)}
+  Messages Received: ${String(stats.messagesReceived).padEnd(14)}
   Negotiations:      ${String(stats.negotiations).padEnd(14)}
 ═════════════════════════════════════════════
 `);
+}
+
+/**
+ * Clear yesterday's sale so the bot can sell again (AUTO_DAILY).
+ */
+function resetForNewDay() {
+    clearAllTimers();
+    sold = false;
+    currentBuyer = null;
+    buyerQueue = [];
+    reactOwnGroupMessages = false;
+    allowTestingRevert = true;
+    stats = {
+        messagesReceived: 0,
+        negotiations: 0,
+        soldPrice: null,
+        buyerName: null,
+        buyerId: null,
+        timeSold: null,
+        isFreeMeal: false,
+        loyaltyRecord: null,
+    };
+    groupReactions.forgetTrackedMessages();
+    console.log('🌅 [Handler] New day — sale state reset.');
 }
 
 async function handleOwnGroupMessage(msg) {
@@ -977,4 +1318,7 @@ function setClient(client) {
     groupReactions.setClient(client);
 }
 
-module.exports = { handleMessage, handleOwnGroupMessage, isSold, handleUnsoldStop, setClient };
+module.exports = {
+    handleMessage, handleOwnGroupMessage, handleAdminCommand, noteOwnMessage, handleReaction,
+    isSold, handleUnsoldStop, resetForNewDay, setClient,
+};

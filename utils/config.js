@@ -5,12 +5,34 @@ const path = require('path');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const SETTINGS_FILE_PATH = path.resolve(PROJECT_ROOT, 'Setting.txt');
+const ENV_FILE_PATH = path.resolve(PROJECT_ROOT, '.env');
+
+// ─── Load .env (secrets such as ANTHROPIC_API_KEY) ──────────
+
+function loadEnvFile(filePath) {
+    if (!fs.existsSync(filePath)) return;
+    for (const line of fs.readFileSync(filePath, 'utf8').split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const separatorIndex = trimmed.indexOf('=');
+        if (separatorIndex === -1) continue;
+        const key = trimmed.slice(0, separatorIndex).trim();
+        const value = trimmed.slice(separatorIndex + 1).trim().replace(/^["']|["']$/g, '');
+        if (key && process.env[key] === undefined) process.env[key] = value;
+    }
+}
+
+loadEnvFile(ENV_FILE_PATH);
 
 // ─── Parse Setting.txt ─────────────────────────────────────
 
 function parseSettingsFile(filePath) {
     if (!fs.existsSync(filePath)) {
-        throw new Error(`Missing Setting.txt at ${filePath}`);
+        // Fresh clone: Setting.txt is personal and git-ignored — start from the template.
+        const example = path.resolve(PROJECT_ROOT, 'Setting.example.txt');
+        if (!fs.existsSync(example)) throw new Error(`Missing Setting.txt at ${filePath}`);
+        fs.copyFileSync(example, filePath);
+        console.warn('⚠️  Created Setting.txt from Setting.example.txt — fill in your UPI ID, numbers and groups, then restart.');
     }
 
     const fileContent = fs.readFileSync(filePath, 'utf8');
@@ -140,6 +162,10 @@ const settings = {
     })(),
 
     UPI_ID: getText(raw, 'UPI_ID'),
+    PAYEE_NAME: getText(raw, 'PAYEE_NAME'),
+    BOT_NUMBER: getText(raw, 'BOT_NUMBER'),
+    UPI_QR_IMAGE_PATH: resolveProjectPath(getText(raw, 'UPI_QR_IMAGE_PATH')),
+    ADMIN_NUMBER: getText(raw, 'ADMIN_NUMBER'),
     QR_IMAGE_PATH: resolveQRImagePath(raw.QR_IMAGE_PATH),
 
     MEAL_TIMINGS: {
@@ -161,12 +187,19 @@ const settings = {
     DEFAULT_MEAL: getText(raw, 'DEFAULT_MEAL'),
     DEFAULT_MESS: getText(raw, 'DEFAULT_MESS'),
     DEFAULT_NUM_MESSAGES: getNumber(raw, 'DEFAULT_NUM_MESSAGES'),
+    POST_INTERVAL_MINUTES: getNumber(raw, 'POST_INTERVAL_MINUTES'),
+    PRICE_SCHEDULE: getText(raw, 'PRICE_SCHEDULE'),
+    AUTO_DAILY: getBoolean(raw, 'AUTO_DAILY'),
+    QR_REFRESH_TIME: getText(raw, 'QR_REFRESH_TIME') || '07:00',
 
     DEFAULT_PRICE: getNumber(raw, 'DEFAULT_PRICE'),
     PRICE_DROP: getNumber(raw, 'PRICE_DROP'),
 
     ENABLE_NEGOTIATION: getBoolean(raw, 'ENABLE_NEGOTIATION'),
     NEGOTIATION_MARGIN: getNumber(raw, 'NEGOTIATION_MARGIN'),
+    NEGOTIATION_SCHEDULE: getText(raw, 'NEGOTIATION_SCHEDULE'),
+    PAYMENT_WINDOW_MINUTES: getNumber(raw, 'PAYMENT_WINDOW_MINUTES') || 10,
+    SCREENSHOT_GRACE_MINUTES: getNumber(raw, 'SCREENSHOT_GRACE_MINUTES') || 5,
 
     BUYER_INACTIVITY_MS: getNumber(raw, 'BUYER_INACTIVITY_MS'),
     BUYER_TIMEOUT_WARNING_MS: getNumber(raw, 'BUYER_TIMEOUT_WARNING_MS'),
@@ -176,6 +209,14 @@ const settings = {
 
     LOYALTY_TARGET: getNumber(raw, 'LOYALTY_TARGET') || 170,
     LOYALTY_CSV_PATH: resolveProjectPath(getText(raw, 'LOYALTY_CSV_PATH')) || resolveProjectPath('utils/purchases.csv'),
+
+    ANTHROPIC_MODEL: getText(raw, 'ANTHROPIC_MODEL') || 'claude-opus-5-5',
+    SCREENSHOT_READER: getText(raw, 'SCREENSHOT_READER') || 'auto',
+    PAYMENT_MAX_AGE_MINUTES: getNumber(raw, 'PAYMENT_MAX_AGE_MINUTES') || 30,
+    MAX_VERIFY_ATTEMPTS: getNumber(raw, 'MAX_VERIFY_ATTEMPTS') || 3,
+    MAX_BUYER_MESSAGE_LENGTH: getNumber(raw, 'MAX_BUYER_MESSAGE_LENGTH') || 80,
+    MANUAL_PAUSE_MINUTES: getNumber(raw, 'MANUAL_PAUSE_MINUTES') || 180,
+    USED_UTR_CSV_PATH: resolveProjectPath(getText(raw, 'USED_UTR_CSV_PATH')) || resolveProjectPath('utils/used_utrs.csv'),
 };
 
 // ─── Template message functions ─────────────────────────────
@@ -188,7 +229,16 @@ settings.sellMessage = (messName, mealType, price) =>
         price,
     });
 
-settings.paymentInstructionMessage = () => getText(raw, 'PAYMENT_INSTRUCTION_MESSAGE');
+settings.paymentInstructionMessage = (price) =>
+    applyTemplate(getText(raw, 'PAYMENT_INSTRUCTION_MESSAGE'), { price, minutes: settings.PAYMENT_WINDOW_MINUTES });
+settings.confirmPromptMessage = (price) =>
+    applyTemplate(getText(raw, 'CONFIRM_PROMPT_MESSAGE'), { price });
+settings.confirmedMessage = (price, minutes) =>
+    applyTemplate(getText(raw, 'CONFIRMED_MESSAGE'), { price, minutes });
+settings.paymentWindowExpiredMessage = (minutes) =>
+    applyTemplate(getText(raw, 'PAYMENT_WINDOW_EXPIRED_MESSAGE'), { minutes });
+settings.priceLockedMessage = (price) =>
+    applyTemplate(getText(raw, 'PRICE_LOCKED_MESSAGE'), { price });
 settings.soldMessage = () => getText(raw, 'SOLD_MESSAGE');
 settings.unrecognizedMessage = () => getText(raw, 'UNRECOGNIZED_MESSAGE');
 settings.timeoutWarningMessage = () => getText(raw, 'TIMEOUT_WARNING_MESSAGE');
@@ -210,6 +260,22 @@ settings.loyaltyReachedMessage = (target) =>
     applyTemplate(getText(raw, 'LOYALTY_REACHED_TEMPLATE'), { target });
 
 settings.testRevertedMessage = () => getText(raw, 'TEST_REVERTED_MESSAGE');
+
+// ─── Payment screenshot verification messages ───────────────
+settings.screenshotRequiredMessage = () => getText(raw, 'SCREENSHOT_REQUIRED_MESSAGE');
+settings.screenshotCheckingMessage = () => getText(raw, 'SCREENSHOT_CHECKING_MESSAGE');
+settings.screenshotStillCheckingMessage = () => getText(raw, 'SCREENSHOT_STILL_CHECKING_MESSAGE');
+settings.screenshotVerifiedMessage = (amount) =>
+    applyTemplate(getText(raw, 'SCREENSHOT_VERIFIED_MESSAGE'), { amount });
+settings.screenshotReviewMessage = (reason) =>
+    applyTemplate(getText(raw, 'SCREENSHOT_REVIEW_MESSAGE'), { reason });
+settings.screenshotNotImageMessage = () => getText(raw, 'SCREENSHOT_NOT_IMAGE_MESSAGE');
+settings.screenshotRetryMessage = (reason, attemptsLeft) =>
+    applyTemplate(getText(raw, 'SCREENSHOT_RETRY_MESSAGE'), { reason, attemptsLeft });
+settings.reviewPendingMessage = () => getText(raw, 'REVIEW_PENDING_MESSAGE');
+settings.adminApprovedMessage = () => getText(raw, 'ADMIN_APPROVED_MESSAGE');
+settings.adminRejectedMessage = () => getText(raw, 'ADMIN_REJECTED_MESSAGE');
+settings.adminReviewCaption = (vars) => applyTemplate(getText(raw, 'ADMIN_REVIEW_CAPTION'), vars);
 
 settings.negotiationAcceptedMessage = (price) =>
     applyTemplate(getText(raw, 'NEGOTIATION_ACCEPTED_MESSAGE'), { price });

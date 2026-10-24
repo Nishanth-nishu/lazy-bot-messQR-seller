@@ -374,9 +374,12 @@ async function resolveTargetGroups(names) {
         return { groups: [], available: [] };
     }
 
-    const wantedLower = wanted.map((n) => n.toLowerCase());
+    // A group matches if its name contains any configured name (case and extra spaces ignored),
+    // so "Mess Buy Sell" picks up "Mess Buy Sell @ IIITH", "Mess Buy Sell - 2 @ IIITH", etc.
+    const normalize = (s) => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
+    const wantedNormalized = wanted.map(normalize);
     const groups = available.filter(
-        (g) => g.name && wantedLower.includes(g.name.trim().toLowerCase()),
+        (g) => g.name && wantedNormalized.some((w) => normalize(g.name).includes(w)),
     );
 
     targetGroups = groups;

@@ -15,9 +15,15 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const config = require('./utils/config');
 const { applyOverrides } = require('./utils/config');
-const { showMenu } = require('./utils/menu');
+const { showMenu, defaultOptions } = require('./utils/menu');
 const { startScheduler, stopScheduler } = require('./utils/priceScheduler');
-const { handleMessage, handleOwnGroupMessage, isSold, handleUnsoldStop, setClient } = require('./utils/messageHandler');
+const {
+    handleMessage, handleOwnGroupMessage, handleAdminCommand, noteOwnMessage, handleReaction,
+    isSold, handleUnsoldStop, resetForNewDay, setClient,
+} = require('./utils/messageHandler');
+const botSends = require('./utils/botSends');
+const paymentVerifier = require('./utils/paymentVerifier');
+const diningPortal = require('./utils/diningPortal');
 const { loadBlocklist, getBlockedNumbers } = require('./utils/blocklist');
 const loyalty = require('./utils/loyalty');
 const groupReactions = require('./utils/groupReactions');
@@ -58,6 +64,9 @@ const client = new Client({
     },
 });
 
+// Note every chat the bot sends to, so messages you type yourself can be told apart.
+botSends.trackClient(client);
+
 let targetChats = [];
 
 // ─── QR Event ───────────────────────────────────────────────
@@ -80,6 +89,13 @@ client.on('ready', async () => {
     try {
         console.log('✅ WhatsApp client is ready!');
         console.log(`👤 Logged in as: ${client.info.pushname} (${client.info.wid.user})\n`);
+
+        const expectedNumber = loyalty.normalizePhoneNumber(config.BOT_NUMBER);
+        const loggedInNumber = loyalty.normalizePhoneNumber(client.info.wid.user);
+        if (expectedNumber && loggedInNumber && expectedNumber !== loggedInNumber) {
+            console.warn(`⚠️  BOT_NUMBER in Setting.txt is ${expectedNumber}, but WhatsApp is logged in as ${loggedInNumber}.`);
+            console.warn('   Delete the .wwebjs_auth folder and scan the QR with the right phone if this is wrong.\n');
+        }
 
         setClient(client);
 
@@ -597,8 +613,16 @@ client.on('ready', async () => {
         targetChats.forEach((c) => console.log(`   • "${c.name}" (${c.id})`));
         console.log('');
 
-        startScheduler(
+        const startSelling = () => startScheduler(
             async (text) => {
+                // Never advertise a meal unless today's QR came from the portal.
+                if (diningPortal.isConfigured() && !diningPortal.isQrFreshToday()) {
+                    const ok = await diningPortal.refreshQr('before post');
+                    if (!ok) {
+                        console.error('⏭️  [Main] Skipping this post — could not get today\'s meal QR from the portal.');
+                        return;
+                    }
+                }
                 for (const chat of targetChats) {
                     try {
                         const sent = await client.sendMessage(chat.id, text);
@@ -621,6 +645,9 @@ client.on('ready', async () => {
                 numMessages: runOpts._numMessages,
             },
         );
+
+        startSelling();
+        if (config.AUTO_DAILY) scheduleDailyRearm(startSelling);
     } catch (err) {
         console.error('❌ [Main] Error in ready handler:', err.message);
         console.error('❌ [Main] Full error:', err);
@@ -628,11 +655,59 @@ client.on('ready', async () => {
     }
 });
 
+// ─── Daily meal QR refresh (QR changes every 24h) ───────────
+let dailyQrTimer = null;
+
+function scheduleDailyQrRefresh() {
+    if (dailyQrTimer) clearTimeout(dailyQrTimer);
+    if (!diningPortal.isConfigured()) return;
+
+    const [h, m] = (config.QR_REFRESH_TIME || '07:00').split(':').map(Number);
+    const next = new Date();
+    next.setHours(h, m, 0, 0);
+    if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1);
+
+    dailyQrTimer = setTimeout(async () => {
+        await diningPortal.refreshQr('morning');
+        scheduleDailyQrRefresh();
+    }, next.getTime() - Date.now());
+
+    console.log(`🍽️  [Main] Next meal QR refresh: ${next.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`);
+}
+
+// ─── Daily re-arm (AUTO_DAILY) ──────────────────────────────
+// Shortly after midnight IST, clear yesterday's sale and schedule today's posts.
+let dailyRearmTimer = null;
+
+function scheduleDailyRearm(startSelling) {
+    if (dailyRearmTimer) clearTimeout(dailyRearmTimer);
+
+    const next = new Date();
+    next.setHours(0, 5, 0, 0);
+    if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1);
+
+    dailyRearmTimer = setTimeout(() => {
+        try {
+            stopScheduler();
+            resetForNewDay();
+            startSelling();
+        } catch (err) {
+            console.error('❌ [Main] Daily re-arm failed:', err.message);
+        }
+        scheduleDailyRearm(startSelling);
+    }, next.getTime() - Date.now());
+
+    console.log(`🌙 [Main] Next daily reset: ${next.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST\n`);
+}
+
 // ─── Message Event ──────────────────────────────────────────
 client.on('message_create', async (msg) => {
     try {
 
         if (msg.fromMe) {
+            // APPROVE / REJECT typed in "Message yourself" when the admin is this account
+            if (await handleAdminCommand(msg)) return;
+            await noteOwnMessage(msg); // you typed in a DM yourself → bot keeps out of that chat
             await handleOwnGroupMessage(msg);
             return;
         }
@@ -645,6 +720,9 @@ client.on('message_create', async (msg) => {
         console.error('❌ [Main] Error handling message:', err.message);
     }
 });
+
+// A 👍 on the bot's message from the current buyer counts as "yes, I'm paying".
+client.on('message_reaction', (reaction) => handleReaction(reaction));
 
 client.on('message_edit', async (msg, newBody, prevBody) => {
     try {
@@ -704,6 +782,8 @@ const shutdownHandler = setupGracefulShutdown({
     client,
     sessionDir,
     onShutdown: async () => {
+        if (dailyRearmTimer) clearTimeout(dailyRearmTimer);
+        if (dailyQrTimer) clearTimeout(dailyQrTimer);
         stopScheduler();
     },
 });
@@ -724,8 +804,25 @@ process.on('exit', () => {
     // and ready to edit well before the bot connects.
     loadBlocklist();
     loyalty.ensureLoyaltyFile(config.LOYALTY_CSV_PATH);
+    paymentVerifier.ensureLedgerFile(config.USED_UTR_CSV_PATH);
 
-    runOpts = await showMenu();
+    const reader = (config.SCREENSHOT_READER || 'auto').toLowerCase();
+    console.log(`🔍 Payment screenshots are read by: ${reader === 'ocr' ? 'free on-PC OCR' : reader === 'claude' ? 'Claude' : 'Claude, falling back to free OCR'}`);
+    if (reader === 'claude' && !process.env.ANTHROPIC_API_KEY) {
+        console.warn('⚠️  SCREENSHOT_READER=claude but ANTHROPIC_API_KEY is not set (add it to .env). Screenshots will wait for the admin.');
+    }
+    if (!config.ADMIN_NUMBER) {
+        console.warn('⚠️  ADMIN_NUMBER is not set in Setting.txt. Screenshots that fail the automatic check cannot be sent for approval.');
+    }
+
+    runOpts = config.AUTO_DAILY ? defaultOptions() : await showMenu();
+
+    if (diningPortal.isConfigured()) {
+        await diningPortal.refreshQr('startup');
+        scheduleDailyQrRefresh();
+    } else {
+        console.warn('⚠️  DINING_API_KEY is not set (add it to .env). The meal QR will not be fetched from the portal — utils/qr.png is used as is.');
+    }
 
     // Apply CLI overrides to global config
     applyOverrides({
