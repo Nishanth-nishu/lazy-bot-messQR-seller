@@ -446,6 +446,12 @@ async function reactToGroupMessages(emoji = REACTION_EMOJI) {
 
     for (const group of groups) {
         const rawIds = tracked.get(group.id) || null;
+        // Only mark the sell posts the bot itself sent — never fall back to "your recent
+        // messages", which would tick things you posted by hand (lunch sales, exchanges…).
+        if (!rawIds || !rawIds.length) {
+            console.log(`ℹ️  [Reactions] "${group.name}": no bot sell posts tracked today — leaving your messages alone.`);
+            continue;
+        }
         try {
             const res = await callToolkit('apply', [
                 group.id,
@@ -497,7 +503,6 @@ async function clearGroupReactions() {
     }
 
     const tracked = groupTrackedByChat();
-    const sinceTs = Math.floor((Date.now() - 12 * 60 * 60 * 1000) / 1000);
     const totals = { ok: 0, matched: 0, failed: 0 };
 
     for (const group of groups) {
@@ -508,14 +513,9 @@ async function clearGroupReactions() {
             if (meta.chatId === group.id) rawIds.add(rawId);
         }
 
+        // Only undo the bot's own posts/reactions — never touch ✅s you put on your own messages.
         const passes = [];
         if (rawIds.size) passes.push({ ids: [...rawIds], opts: { loadRounds: 3 } });
-        // Second pass catches reactions added by hand from the phone that we
-        // never tracked; skip anything the first pass already handled.
-        passes.push({
-            ids: null,
-            opts: { sinceTs, limit: 20, onlyReacted: true, loadRounds: 3, excludeRawIds: [...rawIds] },
-        });
 
         for (const pass of passes) {
             try {

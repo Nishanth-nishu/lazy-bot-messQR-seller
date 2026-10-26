@@ -1303,6 +1303,11 @@ async function handleOwnGroupMessage(msg) {
         const group = groupReactions.getTargetGroups().find((g) => g.id === chatId);
         if (!group) return;
 
+        // Only the bot's own sell post that landed around the sale — never something you
+        // post yourself later (e.g. selling lunch by hand after breakfast was sold).
+        const body = String(msg.body || '');
+        if (!isSellMessageSubstring(body) || !botSends.wasRecentlySentByBot(chatId) || !isWithinSaleWindow()) return;
+
         const reacted = await groupReactions.reactToSingleMessage(msg, chatId);
         if (reacted) {
             console.log(`✅ [Handler] Reacted to your group message in "${group.name}".`);
