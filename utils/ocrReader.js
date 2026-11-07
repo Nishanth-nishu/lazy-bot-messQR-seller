@@ -42,6 +42,7 @@ function detectStatus(text) {
 }
 
 function detectApp(text) {
+    if (/whats\s*app/i.test(text)) return 'WhatsApp Pay';
     if (/google\s*pay|g\s*pay/i.test(text)) return 'Google Pay';
     if (/phone\s*pe/i.test(text)) return 'PhonePe';
     if (/paytm/i.test(text)) return 'Paytm';
@@ -185,4 +186,4 @@ async function shutdown() {
     workerPromise = null;
 }
 
-module.exports = { extractPaymentDetails, shutdown, detectAmount, detectDateTime, detectUtr, detectStatus };
+module.exports = { extractPaymentDetails, shutdown, detectAmount, detectDateTime, detectUtr, detectStatus, detectApp };

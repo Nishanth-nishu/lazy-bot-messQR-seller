@@ -39,6 +39,7 @@ let client = null;
 let targetGroups = [];              // [{ id, name }]
 const trackedMessages = new Map();  // rawId -> { chatId, at }
 const reactedMessages = new Map();  // rawId -> { chatId }
+const postedTexts = [];             // { chatId, text, at } — backup when a post's id wasn't captured
 
 function setClient(c) { client = c; }
 
@@ -411,7 +412,24 @@ function trackSentMessage(msg, chatId) {
     return rawId;
 }
 
+/** Remember the text of a sell post, so it can still be found if its id wasn't returned. */
+function rememberPost(chatId, text) {
+    if (chatId && text) postedTexts.push({ chatId, text: String(text), at: Date.now() });
+}
+
+/** Find the bot's sell posts in a group by their exact text (own messages only). */
+async function findPostsByText(chatId) {
+    const posts = postedTexts.filter((p) => p.chatId === chatId);
+    if (!posts.length) return [];
+    const sinceTs = Math.floor(Math.min(...posts.map((p) => p.at)) / 1000) - 120;
+    const res = await callToolkit('ownMessages', [chatId, { loadRounds: 3, minimum: 5, sinceTs }]);
+    if (!res || res.error) return [];
+    const wanted = new Set(posts.map((p) => p.text.slice(0, 60).trim()));
+    return (res.messages || []).filter((m) => m.rawId && wanted.has(String(m.body || '').trim())).map((m) => m.rawId);
+}
+
 function forgetTrackedMessages() {
+    postedTexts.length = 0;
     trackedMessages.clear();
     reactedMessages.clear();
 }
@@ -445,7 +463,11 @@ async function reactToGroupMessages(emoji = REACTION_EMOJI) {
     const totals = { ok: 0, matched: 0, failed: 0 };
 
     for (const group of groups) {
-        const rawIds = tracked.get(group.id) || null;
+        let rawIds = tracked.get(group.id) || null;
+        if (!rawIds || !rawIds.length) {
+            try { rawIds = await findPostsByText(group.id); } catch (err) { rawIds = null; }
+            if (rawIds && rawIds.length) console.log(`🔎 [Reactions] "${group.name}": found ${rawIds.length} sell post(s) by text.`);
+        }
         // Only mark the sell posts the bot itself sent — never fall back to "your recent
         // messages", which would tick things you posted by hand (lunch sales, exchanges…).
         if (!rawIds || !rawIds.length) {
@@ -509,6 +531,7 @@ async function clearGroupReactions() {
         // Union of what we sent and what we reacted to, so a restart or a manual
         // tap on the phone still gets cleaned up.
         const rawIds = new Set([...(tracked.get(group.id) || [])]);
+        if (!rawIds.size) { try { for (const id of await findPostsByText(group.id)) rawIds.add(id); } catch (_) { /* best effort */ } }
         for (const [rawId, meta] of reactedMessages.entries()) {
             if (meta.chatId === group.id) rawIds.add(rawId);
         }
@@ -584,6 +607,7 @@ module.exports = {
     getTargetGroups,
     setTargetGroups,
     trackSentMessage,
+    rememberPost,
     forgetTrackedMessages,
     reactToGroupMessages,
     clearGroupReactions,

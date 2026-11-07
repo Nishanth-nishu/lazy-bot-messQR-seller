@@ -217,6 +217,11 @@ const settings = {
     MAX_BUYER_MESSAGE_LENGTH: getNumber(raw, 'MAX_BUYER_MESSAGE_LENGTH') || 80,
     MANUAL_PAUSE_MINUTES: getNumber(raw, 'MANUAL_PAUSE_MINUTES') || 180,
     USED_UTR_CSV_PATH: resolveProjectPath(getText(raw, 'USED_UTR_CSV_PATH')) || resolveProjectPath('utils/used_utrs.csv'),
+
+    PAYMENT_GATEWAY: getText(raw, 'PAYMENT_GATEWAY').trim().toLowerCase() || 'none',
+    RAZORPAY_MODE: getText(raw, 'RAZORPAY_MODE').trim().toLowerCase() || 'link',
+    GATEWAY_POLL_SECONDS: getNumber(raw, 'GATEWAY_POLL_SECONDS') || 5,
+    UPI_GATEWAY_URL: getText(raw, 'UPI_GATEWAY_URL').trim() || 'http://127.0.0.1:8000',
 };
 
 // ─── Template message functions ─────────────────────────────
@@ -285,6 +290,32 @@ settings.negotiationDisabledMessage = (price) =>
 
 settings.negotiationCounterOfferMessage = (price) =>
     applyTemplate(getText(raw, 'NEGOTIATION_COUNTER_OFFER_MESSAGE') || 'I can accept up to ₹{price} for this meal.', { price });
+
+// ─── Own UPI QR with the amount filled in ───────────────────
+settings.upiQrAssignMessage = (price) =>
+    applyTemplate(getText(raw, 'UPI_QR_ASSIGN_MESSAGE') || "_This transaction is handled by an automated system._\nPrice is ₹{price}. Reply *YES* (or react 👍) and I'll send you a payment QR with ₹{price} already filled in.", { price });
+settings.upiQrCaption = (price, upi) =>
+    applyTemplate(getText(raw, 'UPI_QR_CAPTION') || 'Scan to pay ₹{price} (amount is already filled in).\nOn the same phone? Save this image and use "Scan from gallery" in GPay/PhonePe — or pay ₹{price} to *{upi}*.', { price, upi });
+
+settings.whatsappPayMessage = (price) =>
+    applyTemplate(getText(raw, 'WHATSAPP_PAY_MESSAGE') || '⚠️ WhatsApp Pay isn\'t supported yet — this automated system can\'t verify it.\n*Don\'t pay again.* The meal is held for you and the seller will confirm your WhatsApp payment and send the QR.\nNext time, please pay with *GPay, PhonePe or Paytm* only.', { price });
+
+settings.paymentNudgeMessage = (price, minutes) =>
+    applyTemplate(getText(raw, 'PAYMENT_NUDGE_MESSAGE') || '⏳ It\'s been {minutes} min. Are you still buying? Pay ₹{price} using the QR above and send the *payment screenshot* here — if someone else asks, the meal goes to them.', { price, minutes });
+
+// ─── Payment gateway (Razorpay QR) messages ─────────────────
+settings.gatewayAssignMessage = (price) =>
+    applyTemplate(getText(raw, 'GATEWAY_ASSIGN_MESSAGE') || "_This transaction is handled by an automated system._\nPrice is ₹{price}. Reply *YES* (or react 👍) and I'll send you a payment link for exactly ₹{price}.", { price });
+settings.gatewayQrCaption = (price, minutes) =>
+    applyTemplate(getText(raw, 'GATEWAY_QR_CAPTION') || '🤝 Deal at ₹{price}! Scan this QR with any UPI app and pay exactly ₹{price} within {minutes} min.\nThe meal QR comes here automatically once the payment goes through — no screenshot needed.', { price, minutes });
+settings.gatewayQrLinkMessage = (price, minutes, url) =>
+    applyTemplate(getText(raw, 'GATEWAY_QR_LINK_MESSAGE') || '🤝 Deal at ₹{price}! Pay exactly ₹{price} within {minutes} min using this link (GPay / PhonePe / any UPI app): {url}\nThe meal QR comes here automatically once the payment goes through — no screenshot needed.', { price, minutes, url });
+settings.gatewayPaidMessage = (amount) =>
+    applyTemplate(getText(raw, 'GATEWAY_PAID_MESSAGE') || '✅ Payment of ₹{amount} received!', { amount });
+settings.gatewayNoScreenshotMessage = () =>
+    getText(raw, 'GATEWAY_NO_SCREENSHOT_MESSAGE') || "No screenshot needed 🙂 I get the payment confirmation directly — your QR comes automatically a few seconds after you pay.";
+settings.gatewayExpiredMessage = (minutes) =>
+    applyTemplate(getText(raw, 'GATEWAY_EXPIRED_MESSAGE') || '⌛ No payment came through in {minutes} min, so the payment link has expired and I\'ve moved to the next buyer. Reply *WANT* if you still want it.', { minutes });
 
 settings.payViaPhoneMessage = (price, upi = settings.UPI_ID) =>
     applyTemplate(getText(raw, 'PAY_VIA_PHONE_MESSAGE') || 'Pay ₹{price} to same no or {UPI}', {

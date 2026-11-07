@@ -11,3 +11,4 @@ utils/used_utrs.csv
 assets/*.png
 .tesseract-cache/
 Setting.txt
+logs/

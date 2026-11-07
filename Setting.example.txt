@@ -47,6 +47,26 @@ PAYMENT_MAX_AGE_MINUTES=30
 MAX_VERIFY_ATTEMPTS=3
 USED_UTR_CSV_PATH=utils/used_utrs.csv
 
+# ─── Payment Gateway ────────────────────────────────────────────
+# upi_qr   = on YES each buyer gets a QR for YOUR UPI ID with the agreed amount already filled in;
+#            they scan, pay and send the screenshot, which is checked as before. Free, instant.
+# razorpay = each buyer gets a one-time Razorpay payment for exactly the agreed price and
+# the meal QR is sent as soon as Razorpay reports the payment (no screenshot needed).
+# Needs RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in .env and "UPI QR codes" enabled on your
+# Razorpay account (QR only). none (or missing keys) = your UPI QR + screenshot check as before.
+# upi_gateway = like upi_qr, but each QR comes from an order in your self-hosted UPI Gateway
+#            (../upi-gateway). With a "Paytm for Business" account in the gateway, the payment is
+#            confirmed automatically; with a plain UPI ID the screenshot check is still used.
+#            Needs UPI_GATEWAY_API_KEY and UPI_GATEWAY_API_SECRET in .env and the gateway running.
+PAYMENT_GATEWAY=upi_qr
+# link = Razorpay payment link (works on every account); qr = one-time UPI QR image
+# (needs "UPI QR codes" enabled by Razorpay Support, falls back to a link)
+RAZORPAY_MODE=link
+# How often to ask Razorpay / the UPI Gateway whether the buyer has paid
+GATEWAY_POLL_SECONDS=5
+# Where the UPI Gateway runs (start-gateway.cmd)
+UPI_GATEWAY_URL=http://127.0.0.1:8000
+
 # ─── Defaults ───────────────────────────────────────────────────
 MESS_NAMES=Palash, Kadamba Veg, Kadamba NV, Yuktahar
 DEFAULT_MEAL=breakfast
@@ -76,15 +96,18 @@ NEGOTIATION_SCHEDULE=07:30=none, 08:30=20, 09:00=15, 09:15=10
 NEGOTIATION_MARGIN=5
 
 # ─── Deal & payment window ──────────────────────────────────────
-# After the buyer says YES / paying / 👍, they must pay within this many minutes of the deal
-PAYMENT_WINDOW_MINUTES=10
-# Extra minutes to send the screenshot before the meal goes to the next buyer
+# After the buyer says YES / paying / 👍 they have this many minutes to pay and send the screenshot.
+# Then: if someone else is waiting, the meal goes to them; if nobody is, the buyer gets a reminder
+# and keeps it until someone else asks.
+PAYMENT_WINDOW_MINUTES=5
+# Extra minutes allowed on the payment time shown in the screenshot (a payment made at 4:59 but sent late still counts)
 SCREENSHOT_GRACE_MINUTES=5
 
 # ─── Buyer Timeout ──────────────────────────────────────────────
-# Time to pay and send a screenshot (only enforced while someone else is waiting)
-BUYER_INACTIVITY_MS=300000
-BUYER_TIMEOUT_WARNING_MS=60000
+# How long the first buyer has to reply before the meal goes to the next person in line
+# (only enforced while someone else is waiting; after they say YES the payment window applies)
+BUYER_INACTIVITY_MS=90000
+BUYER_TIMEOUT_WARNING_MS=30000
 
 # ─── Who counts as a buyer ──────────────────────────────────────
 # New buyers are only answered while a listing is up (first post until sold / stop time).
@@ -107,14 +130,18 @@ LOYALTY_REACHED_TEMPLATE=🎉 Your total spent crossed ₹{target}! Next meal is
 
 # ─── Message Templates ──────────────────────────────────────────
 SELL_MESSAGE_TEMPLATE=Sell {messName} {mealTypeCapitalized} @{price}
-PAYMENT_INSTRUCTION_MESSAGE=_This transaction is handled by an automated system._\nReply *YES* (or react 👍) if you're paying ₹{price} now. Then pay within {minutes} min and send the *payment screenshot* here.
+PAYMENT_INSTRUCTION_MESSAGE=_This transaction is handled by an automated system._\nReply *YES* (or react 👍) if you're paying ₹{price} now. Then pay within {minutes} min and send the *payment screenshot* here.\n⚠️ Pay only with *GPay, PhonePe or Paytm* — WhatsApp Pay is not supported yet.
 CONFIRM_PROMPT_MESSAGE=Reply *YES* (or react 👍) if you're paying ₹{price} now.
-CONFIRMED_MESSAGE=🤝 Deal at ₹{price}! The meal is held for you.\nPay ₹{price} within {minutes} min and send the *payment screenshot* here. Once it's verified, reply *DONE* to get the QR.
-PAYMENT_WINDOW_EXPIRED_MESSAGE=⌛ The {minutes}-min payment window ended without a valid payment screenshot, so I've moved to the next buyer. Reply *WANT* if you still want it.
+CONFIRMED_MESSAGE=🤝 Deal at ₹{price}! The meal is held for you.\nPay ₹{price} within {minutes} min using the QR — *GPay, PhonePe or Paytm only* (WhatsApp Pay is not supported yet). Then send the *payment screenshot* here. Once it's verified, reply *DONE* to get the QR.
+PAYMENT_WINDOW_EXPIRED_MESSAGE=⌛ {minutes} min passed without a payment screenshot and someone else is waiting, so the meal has gone to the next buyer. Reply *WANT* if you still want it.
+PAYMENT_NUDGE_MESSAGE=⏳ It's been {minutes} min. Are you still buying? Pay ₹{price} using the QR above with *GPay, PhonePe or Paytm* (not WhatsApp Pay) and send the *payment screenshot* here — if someone else asks, the meal goes to them.
+WHATSAPP_PAY_MESSAGE=⚠️ WhatsApp Pay isn't supported yet — this automated system can't verify it.\n*Don't pay again.* The meal is held for you and the seller will confirm your WhatsApp payment and send the QR.\nNext time, please pay with *GPay, PhonePe or Paytm* only.
+UPI_QR_CAPTION=Scan to pay ₹{price} (amount is already filled in).\n✅ Use *GPay, PhonePe or Paytm* only.\n❌ *Don't use WhatsApp Pay* — it isn't supported yet and can't be verified.\nOn the same phone? Save this image and use "Scan from gallery" in GPay/PhonePe/Paytm, or pay ₹{price} to *{upi}*.
+UPI_QR_ASSIGN_MESSAGE=_This transaction is handled by an automated system._\nPrice is ₹{price}. Reply *YES* (or react 👍) and I'll send you a payment QR with ₹{price} already filled in.\n⚠️ Pay only with *GPay, PhonePe or Paytm* — WhatsApp Pay is not supported yet.
 PRICE_LOCKED_MESSAGE=The deal is fixed at ₹{price}. Please pay ₹{price} and send the screenshot.
 SOLD_MESSAGE=Sorry, already sold!
 UNRECOGNIZED_MESSAGE=Please send the *payment screenshot* here after paying
-TIMEOUT_WARNING_MESSAGE=⏳ 1 min left to send the payment screenshot before moving to next buyer
+TIMEOUT_WARNING_MESSAGE=⏳ Please reply in 30 sec, or the meal goes to the next buyer
 
 # ─── Payment Verification Messages ──────────────────────────────
 SCREENSHOT_REQUIRED_MESSAGE=Please send the *payment screenshot* first. You'll get the QR once it's verified and you reply *DONE*

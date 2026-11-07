@@ -625,10 +625,13 @@ client.on('ready', async () => {
                 }
                 for (const chat of targetChats) {
                     try {
+                        groupReactions.rememberPost(chat.id, text);
                         const sent = await client.sendMessage(chat.id, text);
                         // Remember exactly what we posted so reactions never have to
                         // rediscover it by re-reading history later.
-                        groupReactions.trackSentMessage(sent, chat.id);
+                        if (!groupReactions.trackSentMessage(sent, chat.id)) {
+                            console.warn(`⚠️  [Main] Posted in "${chat.name}" but WhatsApp gave no message id — will find the post by its text when it's sold.`);
+                        }
                     } catch (err) {
                         console.error(`❌ [Main] Failed to send scheduled message to ${chat.name}:`, err.message);
                     }
@@ -808,6 +811,18 @@ process.on('exit', () => {
 
     const reader = (config.SCREENSHOT_READER || 'auto').toLowerCase();
     console.log(`🔍 Payment screenshots are read by: ${reader === 'ocr' ? 'free on-PC OCR' : reader === 'claude' ? 'Claude' : 'Claude, falling back to free OCR'}`);
+    if (config.PAYMENT_GATEWAY === 'upi_qr') {
+        console.log(`💳 Each buyer gets a UPI QR for ${config.UPI_ID} with the agreed amount filled in (checked from their screenshot).`);
+    }
+    if (config.PAYMENT_GATEWAY === 'upi_gateway') {
+        const upiGateway = require('./utils/upiGateway');
+        if (upiGateway.isEnabled()) console.log(`💳 Each buyer gets a QR from your UPI Gateway at ${upiGateway.baseUrl()}${upiGateway.isTestMode() ? ' — TEST KEYS, no real money' : ''}; the bot checks the order and the screenshot, whichever comes first.`);
+        else console.warn('⚠️  PAYMENT_GATEWAY=upi_gateway but UPI_GATEWAY_API_KEY / UPI_GATEWAY_API_SECRET are not in .env — using your UPI QR + screenshot check.');
+    }
+    if (config.PAYMENT_GATEWAY === 'razorpay') {
+        if (require('./utils/razorpay').isEnabled()) console.log(`💳 Payments go through Razorpay one-time ${config.RAZORPAY_MODE === 'qr' ? 'UPI QRs' : 'payment links'}${require('./utils/razorpay').isTestMode() ? ' — TEST MODE, no real money' : ''} (screenshot check only as a fallback).`);
+        else console.warn('⚠️  PAYMENT_GATEWAY=razorpay but RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET are not in .env — using your UPI QR + screenshot check.');
+    }
     if (reader === 'claude' && !process.env.ANTHROPIC_API_KEY) {
         console.warn('⚠️  SCREENSHOT_READER=claude but ANTHROPIC_API_KEY is not set (add it to .env). Screenshots will wait for the admin.');
     }

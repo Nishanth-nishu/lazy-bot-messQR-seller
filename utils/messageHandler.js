@@ -16,6 +16,12 @@ const loyalty = require('./loyalty');
 const paymentVerifier = require('./paymentVerifier');
 const diningPortal = require('./diningPortal');
 const mediaDownload = require('./mediaDownload');
+const razorpay = require('./razorpay');
+const upiQr = require('./upiQr');
+const upiGateway = require('./upiGateway');
+
+/** Modes where the QR with the agreed amount is sent on YES (not at the price stage). */
+const amountQrMode = () => config.PAYMENT_GATEWAY === 'upi_qr' || config.PAYMENT_GATEWAY === 'upi_gateway';
 
 // ─── State ──────────────────────────────────────────────────
 let sold = false;
@@ -231,6 +237,10 @@ async function handleMessage(msg, client) {
                 }
             }
             currentBuyer.lastActivityAt = Date.now();
+            if (msg.type === 'payment' || msg._data?.type === 'payment') {
+                await handleWhatsAppPay(msg, chat, senderName);
+                return;
+            }
             await handleCurrentBuyerMessage(msg, chat, senderName, body, sellReplyMatch);
             return;
         }
@@ -313,8 +323,14 @@ async function handleCurrentBuyerMessage(msg, chat, senderName, body, sellReplyM
             await chat.sendMessage(config.priceLockedMessage(buyer.agreedPrice));
         } else if (asksForLess) {
             await chat.sendMessage(config.priceLockedMessage(buyer.agreedPrice));
-        } else if (isDoneKeyword(body)) {
-            await chat.sendMessage(config.screenshotRequiredMessage());
+        } else if (isDoneKeyword(body) || (buyer.gateway && /\b(paid|sent|payed|done)\b/i.test(body))) {
+            if (buyer.gateway) {
+                if (!(await checkGatewayPayment(buyer)) && currentBuyer === buyer && !sold) {
+                    await chat.sendMessage(config.gatewayNoScreenshotMessage());
+                }
+            } else {
+                await chat.sendMessage(config.screenshotRequiredMessage());
+            }
         }
         return;
     }
@@ -357,6 +373,12 @@ async function handleBuyerIntent(chat, senderId, senderName, client, contact = n
         console.log(`🔢 [Handler] ${senderName} waiting in line (position ${buyerQueue.length}) behind ${currentBuyer.name}.`);
     }
 
+    // Said YES but the payment window ran out while nobody was waiting → this new buyer gets it.
+    if (currentBuyer.paymentState === 'confirmed' && currentBuyer.windowOver) {
+        console.log(`⏱️  [Handler] ${currentBuyer.name} still hasn't paid after ${config.PAYMENT_WINDOW_MINUTES} min — offering to ${senderName}.`);
+        await expirePaymentWindow(currentBuyer);
+        return;
+    }
     // The first buyer keeps priority while they're responsive or have committed to pay.
     if (buyerIsLocked()) return;
     const idleMs = Date.now() - (currentBuyer.lastActivityAt || currentBuyer.assignedAt);
@@ -480,6 +502,22 @@ async function assignBuyer(chat, senderId, senderName, contact = null, offer = u
         if (freeEligible) {
             await sendTextWithFallbacks(chat, buyerPhone, senderId, config.freeMealAssignMessage(senderName, getCurrentMeal()));
             console.log('🎁 [Loyalty] Sent free meal claim prompt to buyer.');
+        } else if (razorpay.isEnabled()) {
+            // Payment QR is made per buyer once they confirm — nothing to pay yet.
+            if (offer !== undefined) {
+                await handleNegotiation(currentBuyer, offer);
+            } else {
+                await sendTextWithFallbacks(chat, buyerPhone, senderId, config.gatewayAssignMessage(finalPrice));
+            }
+            console.log('📤 [Handler] Price sent (payment QR follows on YES).');
+        } else if (amountQrMode()) {
+            // A QR with the final (possibly negotiated) amount goes out on YES.
+            if (offer !== undefined) {
+                await handleNegotiation(currentBuyer, offer);
+            } else {
+                await sendTextWithFallbacks(chat, buyerPhone, senderId, config.upiQrAssignMessage(finalPrice));
+            }
+            console.log('📤 [Handler] Price sent (UPI QR with the amount follows on YES).');
         } else {
             await sendTextWithFallbacks(chat, buyerPhone, senderId, config.payViaPhoneMessage(finalPrice, config.UPI_ID));
             console.log('📤 [Handler] Payment details sent.');
@@ -509,6 +547,14 @@ async function assignBuyer(chat, senderId, senderName, contact = null, offer = u
 //  TIMERS & QUEUES
 // ═══════════════════════════════════════════════════════════════
 
+function hasWaitingBuyer() {
+    return buyerQueue.some((b) => !isBlockedWid(b.id));
+}
+
+function idleFor(buyer) {
+    return Date.now() - (buyer.lastActivityAt || buyer.assignedAt);
+}
+
 function scheduleNextBuyer(delayMs) {
     if (queueTimer) return; // Wait until current timer finishes
 
@@ -522,6 +568,8 @@ function scheduleNextBuyer(delayMs) {
             queueWarningTimer = null;
             if (sold || !currentBuyer || buyerIsLocked()) return;
             if (!warningBuyerId || currentBuyer.id !== warningBuyerId) return;
+            // They replied since the timer started — no warning yet.
+            if (idleFor(currentBuyer) < config.BUYER_INACTIVITY_MS - config.BUYER_TIMEOUT_WARNING_MS - 1000) return;
             if (buyerQueue.length === 0) return;
             if (isBlockedWid(currentBuyer.id)) return; // blocked mid-purchase
 
@@ -538,7 +586,14 @@ function scheduleNextBuyer(delayMs) {
         queueTimer = null;
         if (sold || !currentBuyer) return;
 
-        console.log(`⏱️  [Timer] ${currentBuyer.name} ran out of time. Checking queue.`);
+        // The clock counts from their last reply, so a buyer who is chatting keeps their turn.
+        const idle = idleFor(currentBuyer);
+        if (!buyerIsLocked() && idle < config.BUYER_INACTIVITY_MS - 1000) {
+            scheduleNextBuyer(config.BUYER_INACTIVITY_MS - idle);
+            return;
+        }
+
+        console.log(`⏱️  [Timer] ${currentBuyer.name} didn't reply for ${Math.round(idle / 1000)}s. Checking queue.`);
         await moveNextBuyer();
     }, safeDelayMs);
 }
@@ -592,6 +647,11 @@ async function removeAllTrackedReactions() {
 function releaseBuyer() {
     clearAllTimers();
     if (currentBuyer?.paymentTimer) clearTimeout(currentBuyer.paymentTimer);
+    if (currentBuyer?.gateway) {
+        stopGatewayPolling(currentBuyer);
+        if (currentBuyer.paymentState !== 'verified') razorpay.cancel(currentBuyer.gateway.handle).catch(() => {});
+    }
+    stopUpiOrderPolling(currentBuyer);
     currentBuyer = null;
     console.log('🔄 [Handler] Buyer reservation released.');
 }
@@ -708,21 +768,240 @@ async function confirmPurchase(buyer, how) {
     clearAllTimers(); // nobody else gets the meal while they pay
 
     if (buyer.paymentTimer) clearTimeout(buyer.paymentTimer);
-    const holdMs = (config.PAYMENT_WINDOW_MINUTES + config.SCREENSHOT_GRACE_MINUTES) * 60 * 1000;
+
+    if (razorpay.isEnabled() && await startGatewayPayment(buyer, how)) return;
+
+    const holdMs = config.PAYMENT_WINDOW_MINUTES * 60 * 1000;
     buyer.paymentTimer = setTimeout(() => expirePaymentWindow(buyer), holdMs);
 
-    console.log(`🤝 [Handler] ${buyer.name} confirmed (${how}) at ₹${buyer.agreedPrice}. Holding the meal for ${config.PAYMENT_WINDOW_MINUTES} min (+${config.SCREENSHOT_GRACE_MINUTES} for the screenshot); ${buyerQueue.length} waiting.`);
+    console.log(`🤝 [Handler] ${buyer.name} confirmed (${how}) at ₹${buyer.agreedPrice}. Holding the meal for ${config.PAYMENT_WINDOW_MINUTES} min (longer if nobody else asks); ${buyerQueue.length} waiting.`);
+    if (amountQrMode() || razorpay.isEnabled()) {
+        // No QR was sent at the price stage — send one with the agreed amount now.
+        await sendAmountQr(buyer);
+    }
     await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id,
         config.confirmedMessage(buyer.agreedPrice, config.PAYMENT_WINDOW_MINUTES));
 }
 
+/** Your UPI QR with the agreed amount pre-filled; the plain UPI QR image if that fails. */
+async function sendAmountQr(buyer) {
+    if (upiGateway.isEnabled() && await sendUpiGatewayQr(buyer)) return;
+    try {
+        const qr = await upiQr.makeQr(buyer.agreedPrice, `Mess meal ${String(buyer.name || '').slice(0, 30)}`);
+        if (qr) {
+            await buyer.chat.sendMessage(new MessageMedia(qr.mimetype, qr.data, 'pay.png'),
+                { caption: config.upiQrCaption(buyer.agreedPrice, config.UPI_ID) });
+            console.log(`📤 [Handler] UPI QR for ₹${buyer.agreedPrice} sent to ${buyer.name}.`);
+            return;
+        }
+    } catch (err) {
+        console.warn(`⚠️  [Handler] Could not send the ₹${buyer.agreedPrice} UPI QR to ${buyer.name}: ${err.message}`);
+    }
+    await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id, config.payViaPhoneMessage(buyer.agreedPrice, config.UPI_ID));
+    if (config.UPI_QR_IMAGE_PATH && fs.existsSync(config.UPI_QR_IMAGE_PATH)) {
+        await sendMediaWithFallbacks(buyer.chat, buyer.phone, buyer.id, config.UPI_QR_IMAGE_PATH);
+    }
+}
+
+// ─── Self-hosted UPI Gateway order ──────────────────────────
+// The QR comes from a gateway order for the agreed price. The gateway is asked every
+// GATEWAY_POLL_SECONDS whether the order is paid; the screenshot check keeps running
+// alongside, so whichever confirms the payment first completes the sale.
+
+/** Create the order and send its QR. Returns false (caller sends the plain QR) on failure. */
+async function sendUpiGatewayQr(buyer) {
+    let order;
+    try {
+        order = await upiGateway.createOrder({ amountRupees: buyer.agreedPrice, buyerName: buyer.name, buyerPhone: buyer.phone });
+        if (!order.id || !order.upiIntent) throw new Error('the order has no UPI link (is the gateway account a UPI account, not a PG?)');
+    } catch (err) {
+        console.error(`❌ [UPI Gateway] Could not create an order for ${buyer.name}: ${err.message} — sending your plain UPI QR instead.`);
+        return false;
+    }
+    if (sold || currentBuyer !== buyer) return true;
+
+    try {
+        const qr = await upiQr.qrForLink(order.upiIntent);
+        await buyer.chat.sendMessage(new MessageMedia(qr.mimetype, qr.data, 'pay.png'),
+            { caption: config.upiQrCaption(buyer.agreedPrice, config.UPI_ID) });
+    } catch (err) {
+        console.warn(`⚠️  [UPI Gateway] Could not send the order QR to ${buyer.name}: ${err.message} — sending your plain UPI QR instead.`);
+        return false;
+    }
+
+    stopUpiOrderPolling(buyer);
+    buyer.upiOrder = { id: order.id, pollTimer: null, checking: false, lastError: null };
+    buyer.upiOrder.pollTimer = setInterval(() => { checkUpiGatewayOrder(buyer).catch(() => {}); }, config.GATEWAY_POLL_SECONDS * 1000);
+    console.log(`📤 [UPI Gateway] Order ${order.id} for ₹${order.amount} sent to ${buyer.name}${order.test ? ' (TEST MODE)' : ''}; checking it every ${config.GATEWAY_POLL_SECONDS}s.`);
+    return true;
+}
+
+function stopUpiOrderPolling(buyer) {
+    if (buyer?.upiOrder?.pollTimer) clearInterval(buyer.upiOrder.pollTimer);
+    if (buyer?.upiOrder) buyer.upiOrder.pollTimer = null;
+}
+
+/** Ask the gateway whether the buyer's order is paid; completes the sale if so. */
+async function checkUpiGatewayOrder(buyer) {
+    const uo = buyer?.upiOrder;
+    const stillOpen = () => !sold && currentBuyer === buyer && ['confirmed', 'verifying', 'review'].includes(buyer.paymentState);
+    if (!uo || uo.checking) return false;
+    if (!stillOpen()) { stopUpiOrderPolling(buyer); return false; }
+    uo.checking = true;
+    let order = null;
+    try {
+        order = await upiGateway.getOrder(uo.id);
+        uo.lastError = null;
+    } catch (err) {
+        if (uo.lastError !== err.message) console.warn(`⚠️  [UPI Gateway] Order check failed for ${buyer.name}: ${err.message}`);
+        uo.lastError = err.message;
+    } finally {
+        uo.checking = false;
+    }
+    if (!order) return false;
+    if (order.status === 'expired' || order.status === 'failed') {
+        // The gateway stops checking it; the screenshot check still works.
+        console.log(`⌛ [UPI Gateway] Order ${uo.id} is ${order.status}; relying on the screenshot check.`);
+        stopUpiOrderPolling(buyer);
+        return false;
+    }
+    if (order.status !== 'paid' || !stillOpen()) return false;
+    if (Math.round(order.amount * 100) !== Math.round(buyer.agreedPrice * 100)) {
+        console.warn(`⚠️  [UPI Gateway] Order ${uo.id} is paid but for ₹${order.amount}, not ₹${buyer.agreedPrice} — ignoring it.`);
+        stopUpiOrderPolling(buyer);
+        return false;
+    }
+
+    stopUpiOrderPolling(buyer);
+    buyer.paymentState = 'verified';
+    clearAllTimers();
+    if (buyer.paymentTimer) clearTimeout(buyer.paymentTimer);
+    if (order.utr) {
+        try {
+            paymentVerifier.recordUtr({ utr: order.utr, phone: buyer.phone, name: buyer.name, amount: order.amount, method: 'upi_gateway' });
+        } catch (err) {
+            console.error('❌ [Verifier] Could not record transaction ID:', err.message);
+        }
+    }
+    console.log(`✅ [UPI Gateway] Order ${uo.id}: ₹${order.amount} received from ${buyer.name}${order.utr ? ` (UTR ${order.utr})` : ''}.`);
+    await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id, config.gatewayPaidMessage(order.amount));
+    await completeSale(buyer.chat, buyer.name);
+    return true;
+}
+
+// ─── Razorpay one-time payment (link or QR) ─────────────────
+// The buyer pays a Razorpay link/QR made for exactly the agreed price; Razorpay tells us
+// when the money is in, so no screenshot is needed. Returns false if it couldn't be made.
+
+async function startGatewayPayment(buyer, how) {
+    let handle;
+    try {
+        handle = await razorpay.createPayment({
+            amountRupees: buyer.agreedPrice,
+            minutes: config.PAYMENT_WINDOW_MINUTES,
+            buyerName: buyer.name,
+            buyerPhone: buyer.phone,
+        });
+    } catch (err) {
+        console.error(`❌ [Razorpay] Could not create a payment for ${buyer.name}: ${err.message} — using UPI screenshot flow.`);
+        return false;
+    }
+    if (sold || currentBuyer !== buyer) {
+        razorpay.cancel(handle).catch(() => {});
+        return true;
+    }
+
+    buyer.gateway = { handle, pollTimer: null, checking: false, lastError: null };
+    const minutes = config.PAYMENT_WINDOW_MINUTES;
+    const image = handle.kind === 'qr' ? await razorpay.downloadQrImage(handle.imageUrl) : null;
+    let sentImage = false;
+    if (image) {
+        try {
+            await buyer.chat.sendMessage(new MessageMedia(image.mimetype, image.data, 'pay.png'),
+                { caption: config.gatewayQrCaption(buyer.agreedPrice, minutes) });
+            sentImage = true;
+        } catch (err) {
+            console.warn(`⚠️  [Razorpay] Could not send QR image to ${buyer.name}: ${err.message}`);
+        }
+    }
+    if (!sentImage) {
+        await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id, config.gatewayQrLinkMessage(buyer.agreedPrice, minutes, handle.url));
+    }
+
+    // The bot cancels the link/QR when the window ends; give a late capture a minute to show up.
+    buyer.paymentTimer = setTimeout(() => expirePaymentWindow(buyer), (minutes + 1) * 60 * 1000);
+    buyer.gateway.pollTimer = setInterval(() => { checkGatewayPayment(buyer).catch(() => {}); }, config.GATEWAY_POLL_SECONDS * 1000);
+    console.log(`🤝 [Handler] ${buyer.name} confirmed (${how}) at ₹${buyer.agreedPrice}. Sent Razorpay ${handle.kind} ${handle.id}; checking every ${config.GATEWAY_POLL_SECONDS}s for ${minutes} min; ${buyerQueue.length} waiting.`);
+    return true;
+}
+
+function stopGatewayPolling(buyer) {
+    if (buyer?.gateway?.pollTimer) clearInterval(buyer.gateway.pollTimer);
+    if (buyer?.gateway) buyer.gateway.pollTimer = null;
+}
+
+/** Ask Razorpay whether the buyer's QR has been paid; completes the sale if so. */
+async function checkGatewayPayment(buyer) {
+    const gw = buyer?.gateway;
+    if (!gw || gw.checking || sold || currentBuyer !== buyer || buyer.paymentState !== 'confirmed') return false;
+    gw.checking = true;
+    let payment = null;
+    try {
+        payment = await razorpay.findPayment(gw.handle, buyer.agreedPrice);
+        gw.lastError = null;
+    } catch (err) {
+        if (gw.lastError !== err.message) console.warn(`⚠️  [Razorpay] Payment check failed for ${buyer.name}: ${err.message}`);
+        gw.lastError = err.message;
+    } finally {
+        gw.checking = false;
+    }
+    if (!payment || sold || currentBuyer !== buyer || buyer.paymentState !== 'confirmed') return false;
+
+    stopGatewayPolling(buyer);
+    buyer.paymentState = 'verified';
+    clearAllTimers();
+    if (buyer.paymentTimer) clearTimeout(buyer.paymentTimer);
+    try {
+        paymentVerifier.recordUtr({ utr: payment.rrn || payment.paymentId, phone: buyer.phone, name: buyer.name, amount: payment.amount, method: 'razorpay' });
+    } catch (err) {
+        console.error('❌ [Verifier] Could not record transaction ID:', err.message);
+    }
+    console.log(`✅ [Razorpay] ₹${payment.amount} received from ${buyer.name} (${payment.paymentId}${payment.vpa ? `, ${payment.vpa}` : ''}).`);
+    await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id, config.gatewayPaidMessage(payment.amount));
+    await completeSale(buyer.chat, buyer.name);
+    return true;
+}
+
 async function expirePaymentWindow(buyer) {
     if (sold || currentBuyer !== buyer) return;
+    if (buyer.gateway) {
+        if (buyer.gateway.checking) {
+            buyer.paymentTimer = setTimeout(() => expirePaymentWindow(buyer), 5000);
+            return;
+        }
+        stopGatewayPolling(buyer);
+        await razorpay.cancel(buyer.gateway.handle);
+        if (await checkGatewayPayment(buyer)) return; // paid at the last second
+        if (sold || currentBuyer !== buyer || buyer.paymentState !== 'confirmed') return;
+        console.log(`⌛ [Handler] No Razorpay payment from ${buyer.name} in time — moving to the next buyer.`);
+        await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id, config.gatewayExpiredMessage(config.PAYMENT_WINDOW_MINUTES));
+        releaseBuyer();
+        await tryNextBuyer();
+        return;
+    }
     if (buyer.paymentState === 'verifying' || buyer.paymentState === 'review') {
         buyer.paymentTimer = setTimeout(() => expirePaymentWindow(buyer), 2 * 60 * 1000); // still being checked
         return;
     }
     if (buyer.paymentState !== 'confirmed') return; // verified (waiting for DONE) or already moved on
+
+    buyer.windowOver = true;
+    if (!hasWaitingBuyer()) {
+        // Nobody else wants it — remind them and keep the meal for them.
+        console.log(`⌛ [Handler] ${buyer.name} hasn't paid in ${config.PAYMENT_WINDOW_MINUTES} min; nobody waiting — reminding them and keeping the meal for them.`);
+        await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id, config.paymentNudgeMessage(buyer.agreedPrice, config.PAYMENT_WINDOW_MINUTES));
+        return;
+    }
 
     console.log(`⌛ [Handler] ${buyer.name}'s payment window ran out — moving to the next buyer.`);
     await sendTextWithFallbacks(buyer.chat, buyer.phone, buyer.id, config.paymentWindowExpiredMessage(config.PAYMENT_WINDOW_MINUTES));
@@ -901,6 +1180,14 @@ async function sendTextWithFallbacks(chat, buyerPhone, senderId, textMessage) {
 async function handleScreenshot(msg, chat, buyerName) {
     const buyer = currentBuyer;
 
+    if (buyer.gateway) {
+        // Razorpay confirms the payment itself; a screenshot means "I paid" — check right away.
+        if (!(await checkGatewayPayment(buyer)) && currentBuyer === buyer && !sold) {
+            await chat.sendMessage(config.gatewayNoScreenshotMessage());
+        }
+        return;
+    }
+
     if (buyer.paymentState === 'verifying') {
         await chat.sendMessage(config.screenshotStillCheckingMessage());
         return;
@@ -940,7 +1227,9 @@ async function handleScreenshot(msg, chat, buyerName) {
     const result = await paymentVerifier.verifyScreenshot(media, {
         amount: buyer.agreedPrice,
         notBefore: new Date(buyer.quotedAt || buyer.assignedAt),
-        notAfter: new Date(dealAt + config.PAYMENT_WINDOW_MINUTES * 60 * 1000),
+        // Kept past the window (nobody else wanted it)? Then any payment up to now counts.
+        notAfter: buyer.windowOver ? new Date()
+            : new Date(dealAt + (config.PAYMENT_WINDOW_MINUTES + config.SCREENSHOT_GRACE_MINUTES) * 60 * 1000),
     });
     if (sold || currentBuyer !== buyer) return; // buyer changed while the screenshot was being read
     buyer.lastCheck = result;
@@ -956,6 +1245,15 @@ async function handleScreenshot(msg, chat, buyerName) {
         const forwarded = await forwardToAdmin(buyer, media, result);
         await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.screenshotReviewMessage(result.reasons.join('; ')));
         console.warn(`⚠️  [Verifier] Automatic check unavailable for ${buyerName}${forwarded ? ' — sent to admin' : ''}.`);
+        return;
+    }
+
+    // A WhatsApp Pay screenshot can't be checked — don't make them pay again; the seller decides.
+    if (result.details?.app === 'WhatsApp Pay') {
+        buyer.paymentState = 'review';
+        const forwarded = await forwardToAdmin(buyer, media, result);
+        await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.whatsappPayMessage(buyer.agreedPrice));
+        console.log(`💬 [Verifier] ${buyerName} sent a WhatsApp Pay screenshot — can't auto-verify${forwarded ? ', sent to the seller' : ''}.`);
         return;
     }
 
@@ -1001,6 +1299,35 @@ async function markPaymentVerified(chat, buyerName, amount, method, utr) {
 function getAdminJid() {
     const adminPhone = loyalty.normalizePhoneNumber(config.ADMIN_NUMBER);
     return adminPhone ? `91${adminPhone}@c.us` : null;
+}
+
+/**
+ * The buyer paid with WhatsApp Pay. The bot can't verify those, so it doesn't ask them to
+ * pay again: it keeps the meal for them and asks the seller to APPROVE or REJECT.
+ */
+async function handleWhatsAppPay(msg, chat, senderName) {
+    const buyer = currentBuyer;
+    const amount1000 = Number(msg._data?.paymentAmount1000);
+    const amount = Number.isFinite(amount1000) && amount1000 > 0 ? amount1000 / 1000 : null;
+    console.log(`💬 [Handler] ${senderName} paid with WhatsApp Pay${amount ? ` (₹${amount})` : ''} — can't auto-verify, asking the seller.`);
+
+    clearAllTimers();
+    if (buyer.paymentTimer) { clearTimeout(buyer.paymentTimer); buyer.paymentTimer = null; }
+    buyer.paymentState = 'review';
+    buyer.lastCheck = {
+        verified: false, error: null, reasons: ['paid with WhatsApp Pay (not auto-checked)'],
+        details: { amount, transaction_id: null, payee_upi: null, payee_name: null, payment_datetime: new Date().toLocaleString('en-IN') },
+    };
+    await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.whatsappPayMessage(buyer.agreedPrice));
+
+    const adminJid = getAdminJid();
+    if (adminJid && globalClient) {
+        try {
+            await globalClient.sendMessage(adminJid, `💬 ${buyer.name} (${buyer.phone || 'unknown'}) says they paid${amount ? ` ₹${amount}` : ''} with *WhatsApp Pay* for the ₹${buyer.agreedPrice} meal.\nCheck your bank/WhatsApp payments and reply *APPROVE* or *REJECT*.`);
+        } catch (err) {
+            console.error('❌ [Handler] Could not tell the seller about the WhatsApp Pay payment:', err.message);
+        }
+    }
 }
 
 async function forwardToAdmin(buyer, media, result) {
@@ -1066,7 +1393,7 @@ async function handleAdminCommand(msg, contact = null) {
 
     // 'review' = waiting on the admin; 'awaiting' with a failed check = bot asked for a resend, admin may overrule.
     const decidable = currentBuyer && (currentBuyer.paymentState === 'review'
-        || (currentBuyer.paymentState === 'awaiting' && currentBuyer.lastCheck));
+        || ((currentBuyer.paymentState === 'awaiting' || currentBuyer.paymentState === 'confirmed') && currentBuyer.lastCheck));
     if (!decidable) {
         await reply('No payment screenshot is waiting for approval.');
         return true;
@@ -1111,6 +1438,8 @@ async function completeSale(chat, buyerName) {
     stats.timeSold = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
 
     clearAllTimers();
+    stopGatewayPolling(currentBuyer);
+    stopUpiOrderPolling(currentBuyer);
     stopScheduler();
 
     console.log(`\n🎉 [Handler] SOLD to ${buyerName}! (Free Meal: ${isFree})`);
@@ -1271,6 +1600,8 @@ function printReport() {
  */
 function resetForNewDay() {
     clearAllTimers();
+    if (currentBuyer?.paymentTimer) clearTimeout(currentBuyer.paymentTimer);
+    stopGatewayPolling(currentBuyer);
     sold = false;
     currentBuyer = null;
     buyerQueue = [];
