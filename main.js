@@ -816,8 +816,13 @@ process.on('exit', () => {
     }
     if (config.PAYMENT_GATEWAY === 'upi_gateway') {
         const upiGateway = require('./utils/upiGateway');
-        if (upiGateway.isEnabled()) console.log(`💳 Each buyer gets a QR from your UPI Gateway at ${upiGateway.baseUrl()}${upiGateway.isTestMode() ? ' — TEST KEYS, no real money' : ''}; the bot checks the order and the screenshot, whichever comes first.`);
-        else console.warn('⚠️  PAYMENT_GATEWAY=upi_gateway but UPI_GATEWAY_API_KEY / UPI_GATEWAY_API_SECRET are not in .env — using your UPI QR + screenshot check.');
+        if (upiGateway.isEnabled()) {
+            console.log(`💳 Each buyer gets a QR from your UPI Gateway at ${upiGateway.baseUrl()}${upiGateway.isTestMode() ? ' — TEST KEYS, no real money' : ''}; the bot checks the order and the screenshot, whichever comes first.`);
+            upiGateway.ensureRunning().then((up) => {
+                if (up) console.log('✅ [UPI Gateway] Running.');
+                else console.warn('⚠️  [UPI Gateway] Not running and could not be started — buyers get your plain UPI QR (screenshot check) until it is.');
+            });
+        } else console.warn('⚠️  PAYMENT_GATEWAY=upi_gateway but UPI_GATEWAY_API_KEY / UPI_GATEWAY_API_SECRET are not in .env — using your UPI QR + screenshot check.');
     }
     if (config.PAYMENT_GATEWAY === 'razorpay') {
         if (require('./utils/razorpay').isEnabled()) console.log(`💳 Payments go through Razorpay one-time ${config.RAZORPAY_MODE === 'qr' ? 'UPI QRs' : 'payment links'}${require('./utils/razorpay').isTestMode() ? ' — TEST MODE, no real money' : ''} (screenshot check only as a fallback).`);

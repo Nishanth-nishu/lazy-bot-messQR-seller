@@ -298,7 +298,11 @@ settings.upiQrCaption = (price, upi) =>
     applyTemplate(getText(raw, 'UPI_QR_CAPTION') || 'Scan to pay ₹{price} (amount is already filled in).\nOn the same phone? Save this image and use "Scan from gallery" in GPay/PhonePe — or pay ₹{price} to *{upi}*.', { price, upi });
 
 settings.whatsappPayMessage = (price) =>
-    applyTemplate(getText(raw, 'WHATSAPP_PAY_MESSAGE') || '⚠️ WhatsApp Pay isn\'t supported yet — this automated system can\'t verify it.\n*Don\'t pay again.* The meal is held for you and the seller will confirm your WhatsApp payment and send the QR.\nNext time, please pay with *GPay, PhonePe or Paytm* only.', { price });
+    applyTemplate(getText(raw, 'WHATSAPP_PAY_MESSAGE') || '✅ Got your WhatsApp payment — *don\'t pay again*, the meal is held for you.\nTo verify it, please send a *screenshot of the payment details* showing the *UPI transaction ID (UTR)*: tap the ₹{price} payment in this chat to open its details.\nNext time, please pay with *GPay, PhonePe or Paytm*.', { price });
+settings.whatsappPayUtrRetryMessage = (reason) =>
+    applyTemplate(getText(raw, 'WHATSAPP_PAY_UTR_RETRY_MESSAGE') || '⚠️ I couldn\'t verify that screenshot ({reason}).\n*Don\'t pay again.* Tap the payment in this chat to open its details, and send a screenshot where the amount and the 12-digit *UPI transaction ID (UTR)* are clearly visible.', { reason });
+settings.whatsappPayReviewMessage = () =>
+    getText(raw, 'WHATSAPP_PAY_REVIEW_MESSAGE') || '🕵️ I couldn\'t verify your WhatsApp payment automatically. *Don\'t pay again* — the meal is held for you and the seller will check it and send the QR.';
 
 settings.paymentNudgeMessage = (price, minutes) =>
     applyTemplate(getText(raw, 'PAYMENT_NUDGE_MESSAGE') || '⏳ It\'s been {minutes} min. Are you still buying? Pay ₹{price} using the QR above and send the *payment screenshot* here — if someone else asks, the meal goes to them.', { price, minutes });

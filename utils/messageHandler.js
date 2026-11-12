@@ -994,6 +994,7 @@ async function expirePaymentWindow(buyer) {
         return;
     }
     if (buyer.paymentState !== 'confirmed') return; // verified (waiting for DONE) or already moved on
+    if (buyer.whatsappPay) return; // paid with WhatsApp Pay; waiting for their UTR screenshot, keep the meal
 
     buyer.windowOver = true;
     if (!hasWaitingBuyer()) {
@@ -1228,7 +1229,7 @@ async function handleScreenshot(msg, chat, buyerName) {
         amount: buyer.agreedPrice,
         notBefore: new Date(buyer.quotedAt || buyer.assignedAt),
         // Kept past the window (nobody else wanted it)? Then any payment up to now counts.
-        notAfter: buyer.windowOver ? new Date()
+        notAfter: (buyer.windowOver || buyer.whatsappPay) ? new Date()
             : new Date(dealAt + (config.PAYMENT_WINDOW_MINUTES + config.SCREENSHOT_GRACE_MINUTES) * 60 * 1000),
     });
     if (sold || currentBuyer !== buyer) return; // buyer changed while the screenshot was being read
@@ -1248,12 +1249,30 @@ async function handleScreenshot(msg, chat, buyerName) {
         return;
     }
 
-    // A WhatsApp Pay screenshot can't be checked — don't make them pay again; the seller decides.
+    // WhatsApp Pay: checked by its UTR. WhatsApp's details screen often doesn't show the payee's
+    // UPI ID; when WhatsApp's own payment message in this chat already showed the money coming
+    // to us, a missing payee is fine as long as amount, UTR (unused) and time all pass.
     if (result.details?.app === 'WhatsApp Pay') {
+        const onlyPayeeUnreadable = result.reasons.length > 0
+            && result.reasons.every((r) => /^paid to unknown payee/.test(r));
+        if (buyer.whatsappPay && onlyPayeeUnreadable) {
+            await markPaymentVerified(chat, buyerName, result.details.amount, 'whatsapp_pay', result.details.transaction_id);
+            return;
+        }
+        buyer.whatsappPay ||= { amount: null, at: Date.now() }; // they paid — never move the meal on
+        if (buyer.paymentTimer) { clearTimeout(buyer.paymentTimer); buyer.paymentTimer = null; }
+        buyer.utrTries = (buyer.utrTries || 0) + 1;
+        if (buyer.utrTries < config.MAX_VERIFY_ATTEMPTS) {
+            buyer.paymentState = 'confirmed';
+            forwardToAdmin(buyer, media, result).catch(() => {}); // FYI; the seller can still APPROVE
+            await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.whatsappPayUtrRetryMessage(result.reasons.join('; ')));
+            console.log(`🔁 [Verifier] ${buyerName}'s WhatsApp Pay screenshot didn't pass (${result.reasons.join('; ')}) — asked for one showing the UTR (${buyer.utrTries}/${config.MAX_VERIFY_ATTEMPTS}).`);
+            return;
+        }
         buyer.paymentState = 'review';
         const forwarded = await forwardToAdmin(buyer, media, result);
-        await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.whatsappPayMessage(buyer.agreedPrice));
-        console.log(`💬 [Verifier] ${buyerName} sent a WhatsApp Pay screenshot — can't auto-verify${forwarded ? ', sent to the seller' : ''}.`);
+        await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.whatsappPayReviewMessage());
+        console.log(`💬 [Verifier] ${buyerName}'s WhatsApp Pay screenshots couldn't be verified${forwarded ? ' — sent to the seller' : ''}.`);
         return;
     }
 
@@ -1262,6 +1281,13 @@ async function handleScreenshot(msg, chat, buyerName) {
     buyer.failedChecks = (buyer.failedChecks || 0) + 1;
     forwardToAdmin(buyer, media, result).catch(() => {}); // FYI only; the admin can still APPROVE later
 
+    if (buyer.failedChecks >= config.MAX_VERIFY_ATTEMPTS && buyer.whatsappPay) {
+        // They already paid with WhatsApp Pay — don't take the meal away; the seller decides.
+        buyer.paymentState = 'review';
+        await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.whatsappPayReviewMessage());
+        console.log(`💬 [Verifier] ${buyerName} paid with WhatsApp Pay but no screenshot passed — waiting for the seller.`);
+        return;
+    }
     if (buyer.failedChecks >= config.MAX_VERIFY_ATTEMPTS) {
         console.log(`🚫 [Verifier] ${buyerName} failed ${buyer.failedChecks} screenshot checks — moving to the next buyer.`);
         await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.adminRejectedMessage());
@@ -1302,20 +1328,24 @@ function getAdminJid() {
 }
 
 /**
- * The buyer paid with WhatsApp Pay. The bot can't verify those, so it doesn't ask them to
- * pay again: it keeps the meal for them and asks the seller to APPROVE or REJECT.
+ * The buyer paid with WhatsApp Pay. Don't make them pay again: keep the meal for them and ask
+ * for a screenshot of the payment details showing the UPI transaction ID (UTR), which is then
+ * checked like any other screenshot. The seller can still APPROVE or REJECT by hand.
  */
 async function handleWhatsAppPay(msg, chat, senderName) {
     const buyer = currentBuyer;
     const amount1000 = Number(msg._data?.paymentAmount1000);
     const amount = Number.isFinite(amount1000) && amount1000 > 0 ? amount1000 / 1000 : null;
-    console.log(`💬 [Handler] ${senderName} paid with WhatsApp Pay${amount ? ` (₹${amount})` : ''} — can't auto-verify, asking the seller.`);
+    console.log(`💬 [Handler] ${senderName} paid with WhatsApp Pay${amount ? ` (₹${amount})` : ''} — asking for a screenshot with the UTR.`);
 
     clearAllTimers();
     if (buyer.paymentTimer) { clearTimeout(buyer.paymentTimer); buyer.paymentTimer = null; }
-    buyer.paymentState = 'review';
+    if (buyer.paymentState === 'verified') return;
+    buyer.paymentState = 'confirmed'; // the next screenshot is checked as usual
+    buyer.confirmedAt ||= Date.now();
+    buyer.whatsappPay = { amount, at: Date.now() };
     buyer.lastCheck = {
-        verified: false, error: null, reasons: ['paid with WhatsApp Pay (not auto-checked)'],
+        verified: false, error: null, reasons: ['paid with WhatsApp Pay; waiting for a screenshot with the UTR'],
         details: { amount, transaction_id: null, payee_upi: null, payee_name: null, payment_datetime: new Date().toLocaleString('en-IN') },
     };
     await sendTextWithFallbacks(chat, buyer.phone, buyer.id, config.whatsappPayMessage(buyer.agreedPrice));
@@ -1323,7 +1353,7 @@ async function handleWhatsAppPay(msg, chat, senderName) {
     const adminJid = getAdminJid();
     if (adminJid && globalClient) {
         try {
-            await globalClient.sendMessage(adminJid, `💬 ${buyer.name} (${buyer.phone || 'unknown'}) says they paid${amount ? ` ₹${amount}` : ''} with *WhatsApp Pay* for the ₹${buyer.agreedPrice} meal.\nCheck your bank/WhatsApp payments and reply *APPROVE* or *REJECT*.`);
+            await globalClient.sendMessage(adminJid, `💬 ${buyer.name} (${buyer.phone || 'unknown'}) paid${amount ? ` ₹${amount}` : ''} with *WhatsApp Pay* for the ₹${buyer.agreedPrice} meal. I've asked them for a screenshot showing the UTR and will check it.\nTo decide yourself, reply *APPROVE* or *REJECT*.`);
         } catch (err) {
             console.error('❌ [Handler] Could not tell the seller about the WhatsApp Pay payment:', err.message);
         }

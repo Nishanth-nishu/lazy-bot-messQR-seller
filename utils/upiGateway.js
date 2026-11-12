@@ -99,4 +99,34 @@ async function getOrder(orderId) {
     return toOrder(await request('GET', `/orders/${encodeURIComponent(orderId)}`));
 }
 
-module.exports = { isEnabled, isTestMode, createOrder, getOrder, baseUrl };
+/** True if anything answers at the gateway's address. */
+async function isUp() {
+    try {
+        await fetch(`${baseUrl()}/up`, { signal: AbortSignal.timeout(3000) });
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+/**
+ * Start the gateway (start-gateway.cmd: MariaDB + the gateway) in the background if it isn't
+ * running, and wait up to ~40 s for it. Returns true once it answers.
+ */
+async function ensureRunning() {
+    if (await isUp()) return true;
+    const path = require('path');
+    const fs = require('fs');
+    const script = path.resolve(__dirname, '..', 'start-gateway.cmd');
+    if (process.platform !== 'win32' || !fs.existsSync(script)) return false;
+    const { spawn } = require('child_process');
+    const child = spawn('cmd.exe', ['/c', script], { cwd: path.dirname(script), detached: true, stdio: 'ignore', windowsHide: true });
+    child.unref();
+    for (let i = 0; i < 20; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        if (await isUp()) return true;
+    }
+    return false;
+}
+
+module.exports = { isEnabled, isTestMode, createOrder, getOrder, baseUrl, isUp, ensureRunning };
